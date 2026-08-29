@@ -17,7 +17,7 @@
  * - every hook fails open instead of breaking the adventure
  */
 
-var CW_SCHEMA = 6;
+var CW_SCHEMA = 7;
 
 var CW_DEFAULTS = {
   enabled: true,
@@ -32,6 +32,14 @@ var CW_DEFAULTS = {
   fuzzyThreshold: 0.72,
   negationAware: true,
   negationWindow: 42,
+
+  /* Usability / scheduler */
+  preset: "balanced",            /* balanced | strict | player_first | cinematic | source_locked | minimal */
+  fairScheduler: true,
+  starvationTurns: 8,
+  starvationBoost: 1800,
+  allowPreemption: true,
+  preemptPriorityGap: 25,
 
   /* Timeline */
   globalCooldown: 0,
@@ -54,6 +62,9 @@ var CW_DEFAULTS = {
   autoIncludeDiversity: true,
   autoIncludeTypeCap: 2,
   autoIncludeDedupe: true,
+  smartCardExtract: true,
+  smartCardSentences: 5,
+  smartCardLeadChars: 260,
   maxInjectChars: 7600,
   adaptiveContextBudget: true,
   maxContextShare: 0.20,
@@ -104,6 +115,12 @@ var CW_DEFAULTS = {
   franchiseDivergence: "adaptive",    /* strict | adaptive | reactive */
   franchisePlayerRole: "original_character", /* original_character | canon_protagonist | replacement | observer */
   franchisePlannerMaxChars: 6800,
+  franchisePlannerNonce: true,
+  franchiseSourceFilterStrict: true,
+  franchiseRebuildOnSourceChange: false,
+  franchiseBuildMode: "steady",      /* steady | frontload | manual */
+  franchiseDeliveryPolicy: "adaptive", /* adaptive | scene | world | offscreen */
+  franchiseOutcomePolicy: "adaptive",  /* adaptive | fixed | flexible | opportunity */
 
   /* Validation / UI */
   validateGraph: true,
@@ -199,6 +216,14 @@ function CW_onContext(text, parsed, cfg) {
 
   var active = s.activeId ? CW_findEvent(parsed.events, s.activeId) : null;
   if (active) CW_applyEventDefaults(active, cfg);
+
+  if (active && cfg.allowPreemption) {
+    var preemptor = CW_selectPreemptor(parsed.events, active, cfg);
+    if (preemptor) {
+      CW_preemptActive(active, preemptor, cfg);
+      active = preemptor;
+    }
+  }
 
   if (!active) {
     active = CW_selectEvent(parsed.events, cfg);
@@ -363,6 +388,8 @@ function CW_state() {
 
       /* Schema 5: expanded AI-assisted franchise roadmap generation. */
       /* Schema 6: resolved dependencies, adaptive budgets, stronger retry/franchise hardening. */
+      /* Schema 7: merged configs, presets, fair scheduling, preemption, smart lore extraction,
+         stronger franchise source grounding and nonce-verified planner protocol. */
       franchise: {
         identity: "",
         name: "",
@@ -385,7 +412,10 @@ function CW_state() {
         sourceRefs: [],
         suggestions: [],
         lastBatchSummary: "",
-        roadmapKey: ""
+        roadmapKey: "",
+        planNonce: "",
+        sourceHash: "",
+        sourceChanged: false
       }
     };
   }
@@ -463,6 +493,10 @@ function CW_migrateState(s) {
     s.franchise = s.franchise || {};
     s.schema = 6;
   }
+  if (s.schema < 7) {
+    s.franchise = s.franchise || {};
+    s.schema = 7;
+  }
   CW_ensureFranchiseState(s);
 }
 
@@ -484,6 +518,9 @@ function CW_eventState(id) {
       lastAttemptTurn: 0,
       lastCompleteTurn: 0,
       nextEligibleTurn: 0,
+      eligibleSince: 0,
+      lastEligibleTurn: 0,
+      preemptions: 0,
       lastReason: ""
     };
   }
@@ -619,6 +656,8 @@ function CW_rewindTo(targetTurn, events) {
     if (es.startedTurn > targetTurn || es.lastAttemptTurn > targetTurn || es.lastProgressTurn > targetTurn) {
       es.status = CW_completed(k) ? "complete" : "dormant";
       es.attempts = 0; es.cycles = 0; es.nextEligibleTurn = 0;
+      if (es.eligibleSince > targetTurn) es.eligibleSince = 0;
+      if (es.lastEligibleTurn > targetTurn) es.lastEligibleTurn = 0;
       es.lastAttemptTurn = Math.min(es.lastAttemptTurn || 0, targetTurn);
       es.lastProgressTurn = Math.min(es.lastProgressTurn || 0, targetTurn);
     }
@@ -742,7 +781,10 @@ function CW_seenTurn(rec) {
 function CW_parseAllCards() {
   var cards = (typeof storyCards !== "undefined" && storyCards) ? storyCards : [];
   var events = [];
-  var config = null;
+  var config = {};
+  var configBlocks = [];
+  var configCount = 0;
+  var configCardIndices = [];
   var dashboardIndex = -1;
   var i;
 
@@ -752,7 +794,10 @@ function CW_parseAllCards() {
     var entryMarker = CW_firstMarker(c.entry || "");
 
     if (type === "canon config" || type === "canon weave config" || entryMarker === "@canon_config") {
-      config = CW_parseConfigCard(c);
+      var cm = CW_parseConfigCard(c);
+      configBlocks.push({ meta:cm, priority:CW_int(cm.config_priority || cm.configpriority, 0), index:i });
+      configCount += 1;
+      configCardIndices.push(i);
       continue;
     }
 
@@ -766,6 +811,9 @@ function CW_parseAllCards() {
     }
   }
 
+  configBlocks.sort(function(a,b) { if (a.priority !== b.priority) return a.priority - b.priority; return a.index - b.index; });
+  for (i = 0; i < configBlocks.length; i++) CW_mergeInto(config, configBlocks[i].meta);
+
   /* Virtual generated cards are only used when materialization was explicitly
      disabled. addStoryCard is the normal/default path. */
   var fs = CW_state().franchise;
@@ -778,7 +826,7 @@ function CW_parseAllCards() {
     }
   }
 
-  return { cards: cards, events: events, config: config, dashboardIndex: dashboardIndex };
+  return { cards: cards, events: events, config: config, configCount:configCount, configCardIndices:configCardIndices, dashboardIndex: dashboardIndex };
 }
 
 function CW_firstMarker(src) {
@@ -791,6 +839,7 @@ function CW_firstMarker(src) {
     if (t === "@canon") return "@canon";
     if (t === "@canon_config" || t === "@canon config") return "@canon_config";
     if (t === "@canon_dashboard" || t === "@canon dashboard") return "@canon_dashboard";
+    if (t === "@canon_source" || t === "@canon source") return "@canon_source";
     return "";
   }
 
@@ -847,6 +896,7 @@ function CW_parseEventCard(card) {
 
     /* conditions */
     whenAny: CW_altTerms(CW_pick(m, ["when","when_any","trigger","any"])),
+    whenMin: Math.max(1, CW_int(m.when_min || m.whenmin, 1)),
     whenAll: CW_terms(CW_pick(m, ["when_all","whenall","scene_all","sceneall"])),
     whenClauses: CW_clauseGroups(m.when_clauses || m.whenclauses || ""),
     requireAll: CW_terms(CW_pick(m, ["require","requires","seen","require_all"])),
@@ -889,11 +939,15 @@ function CW_parseEventCard(card) {
     lead: Math.max(0, CW_int(m.lead || m.foreshadow_lead || m.foreshadowlead, 0)),
     seed: String(m.seed || m.foreshadow || ""),
     bridge: String(m.bridge || ""),
+    delivery: CW_deliveryMode(m.delivery || m.delivery_mode || m.deliverymode || ""),
+    outcomePolicy: CW_outcomePolicy(m.outcome || m.outcome_policy || m.outcomepolicy || ""),
+    playerPresence: CW_playerPresence(m.player_presence || m.playerpresence || m.presence || ""),
     protect: CW_terms(m.protect || m.must_keep || m.mustkeep || ""),
     forbid: CW_altTerms(m.forbid || m.do_not || m.donot || ""),
 
     /* completion */
     completeAny: CW_altTerms(CW_pick(m, ["complete","completion","complete_any"])),
+    completeMin: Math.max(1, CW_int(m.complete_min || m.completemin, 1)),
     completeAll: CW_terms(CW_pick(m, ["complete_all","completeall"])),
     completeClauses: CW_clauseGroups(m.complete_clauses || m.completeclauses || ""),
     completeRegex: String(CW_pick(m, ["complete_regex","completeregex"]) || ""),
@@ -962,95 +1016,146 @@ function CW_parseMetaBlock(src, marker) {
   return { meta: meta, body: body.join("\n") };
 }
 
+
+function CW_presetDefaults(v) {
+  var out = {}, k;
+  for (k in CW_DEFAULTS) if (CW_DEFAULTS.hasOwnProperty(k)) out[k] = CW_DEFAULTS[k];
+  v = CW_norm(v || "balanced").replace(/\s+/g, "_");
+  if (v !== "balanced" && v !== "strict" && v !== "player_first" && v !== "cinematic" && v !== "source_locked" && v !== "minimal") v = "balanced";
+  out.preset = v;
+
+  if (v === "strict") {
+    out.defaultMatch = "strict"; out.completionMatch = "strict"; out.blockerMatch = "strict";
+    out.fuzzyThreshold = 0.86; out.franchiseConfidenceFloor = 0.72;
+    out.franchiseSourceMode = "prefer"; out.franchiseDivergence = "strict";
+    out.franchiseRequireSourceRef = true; out.autoIncludeCards = 2;
+  } else if (v === "player_first") {
+    out.defaultDeadlinePolicy = "catchup"; out.forceDeadlineGrace = 5;
+    out.defaultMode = "soft"; out.strongCycles = 2; out.franchiseDivergence = "reactive";
+    out.franchiseDeadlinePolicy = "catchup"; out.franchiseEnforcement = "soft";
+    out.franchiseOutcomePolicy = "opportunity"; out.franchiseDeliveryPolicy = "adaptive";
+  } else if (v === "cinematic") {
+    out.foreshadowLead = 6; out.maxForeshadowEvents = 2; out.defaultMode = "strong";
+    out.franchiseGranularity = "major"; out.franchisePacing = "normal";
+    out.franchiseDeliveryPolicy = "adaptive"; out.franchiseOutcomePolicy = "flexible";
+  } else if (v === "source_locked") {
+    out.defaultMatch = "strict"; out.completionMatch = "strict"; out.blockerMatch = "strict";
+    out.franchiseSourceMode = "require"; out.franchiseRequireSourceRef = true;
+    out.franchiseConfidenceFloor = 0.80; out.franchiseDivergence = "strict";
+    out.franchiseDeadlinePolicy = "force"; out.franchiseOutcomePolicy = "fixed";
+  } else if (v === "minimal") {
+    out.autoInclude = false; out.foreshadow = false; out.dashboard = false;
+    out.maxIncludeCards = 3; out.maxInjectChars = 4200; out.franchiseAutoGenerate = false;
+  }
+  return out;
+}
+
 function CW_buildConfig(meta) {
   meta = meta || {};
+  var base = CW_presetDefaults(meta.preset || meta.profile || meta.config_preset || CW_DEFAULTS.preset);
 
   var cfg = {
-    enabled: CW_bool(meta.enabled, CW_DEFAULTS.enabled),
-    sceneActions: Math.max(1, CW_int(meta.scene_actions || meta.sceneactions, CW_DEFAULTS.sceneActions)),
-    evidenceTurns: Math.max(20, CW_int(meta.evidence_turns || meta.evidenceturns, CW_DEFAULTS.evidenceTurns)),
-    maxEvidenceKeys: Math.max(100, CW_int(meta.max_evidence_keys || meta.maxevidencekeys, CW_DEFAULTS.maxEvidenceKeys)),
-    defaultMatch: CW_matchMode(meta.default_match || meta.defaultmatch || CW_DEFAULTS.defaultMatch),
-    completionMatch: CW_matchMode(meta.completion_match || meta.completionmatch || CW_DEFAULTS.completionMatch),
-    blockerMatch: CW_matchMode(meta.blocker_match || meta.blockermatch || CW_DEFAULTS.blockerMatch),
-    fuzzyThreshold: CW_clamp(CW_num(meta.fuzzy_threshold || meta.fuzzythreshold, CW_DEFAULTS.fuzzyThreshold), 0.5, 1),
-    negationAware: CW_bool(meta.negation_aware || meta.negationaware, CW_DEFAULTS.negationAware),
-    negationWindow: Math.max(12, CW_int(meta.negation_window || meta.negationwindow, CW_DEFAULTS.negationWindow)),
+    preset: base.preset,
+    enabled: CW_bool(meta.enabled, base.enabled),
+    sceneActions: Math.max(1, CW_int(meta.scene_actions || meta.sceneactions, base.sceneActions)),
+    evidenceTurns: Math.max(20, CW_int(meta.evidence_turns || meta.evidenceturns, base.evidenceTurns)),
+    maxEvidenceKeys: Math.max(100, CW_int(meta.max_evidence_keys || meta.maxevidencekeys, base.maxEvidenceKeys)),
+    defaultMatch: CW_matchMode(meta.default_match || meta.defaultmatch || base.defaultMatch),
+    completionMatch: CW_matchMode(meta.completion_match || meta.completionmatch || base.completionMatch),
+    blockerMatch: CW_matchMode(meta.blocker_match || meta.blockermatch || base.blockerMatch),
+    fuzzyThreshold: CW_clamp(CW_num(meta.fuzzy_threshold || meta.fuzzythreshold, base.fuzzyThreshold), 0.5, 1),
+    negationAware: CW_bool(meta.negation_aware || meta.negationaware, base.negationAware),
+    negationWindow: Math.max(12, CW_int(meta.negation_window || meta.negationwindow, base.negationWindow)),
 
-    globalCooldown: Math.max(0, CW_int(meta.global_cooldown || meta.globalcooldown, CW_DEFAULTS.globalCooldown)),
-    allowCatchUp: CW_bool(meta.allow_catch_up || meta.allowcatchup, CW_DEFAULTS.allowCatchUp),
-    defaultDeadlinePolicy: CW_deadlinePolicy(meta.default_deadline_policy || meta.defaultdeadlinepolicy || CW_DEFAULTS.defaultDeadlinePolicy),
-    forceDeadlineGrace: Math.max(0, CW_int(meta.force_deadline_grace || meta.forcedeadlinegrace, CW_DEFAULTS.forceDeadlineGrace)),
+    fairScheduler: CW_bool(meta.fair_scheduler || meta.fairscheduler, base.fairScheduler),
+    starvationTurns: Math.max(0, CW_int(meta.starvation_turns || meta.starvationturns, base.starvationTurns)),
+    starvationBoost: Math.max(0, CW_int(meta.starvation_boost || meta.starvationboost, base.starvationBoost)),
+    allowPreemption: CW_bool(meta.allow_preemption || meta.allowpreemption, base.allowPreemption),
+    preemptPriorityGap: Math.max(1, CW_int(meta.preempt_priority_gap || meta.preemptprioritygap, base.preemptPriorityGap)),
 
-    defaultMode: CW_mode(meta.default_mode || meta.defaultmode || CW_DEFAULTS.defaultMode),
-    defaultRetries: Math.max(1, CW_int(meta.default_retries || meta.defaultretries, CW_DEFAULTS.defaultRetries)),
-    strongCycles: Math.max(1, CW_int(meta.strong_cycles || meta.strongcycles, CW_DEFAULTS.strongCycles)),
-    retryDelay: Math.max(0, CW_int(meta.retry_delay || meta.retrydelay, CW_DEFAULTS.retryDelay)),
-    forceMaxAttempts: Math.max(1, CW_int(meta.force_max_attempts || meta.forcemaxattempts, CW_DEFAULTS.forceMaxAttempts)),
+    globalCooldown: Math.max(0, CW_int(meta.global_cooldown || meta.globalcooldown, base.globalCooldown)),
+    allowCatchUp: CW_bool(meta.allow_catch_up || meta.allowcatchup, base.allowCatchUp),
+    defaultDeadlinePolicy: CW_deadlinePolicy(meta.default_deadline_policy || meta.defaultdeadlinepolicy || base.defaultDeadlinePolicy),
+    forceDeadlineGrace: Math.max(0, CW_int(meta.force_deadline_grace || meta.forcedeadlinegrace, base.forceDeadlineGrace)),
 
-    maxIncludeCards: Math.max(0, CW_int(meta.max_include_cards || meta.maxincludecards, CW_DEFAULTS.maxIncludeCards)),
-    autoInclude: CW_bool(meta.auto_include || meta.autoinclude, CW_DEFAULTS.autoInclude),
-    autoIncludeCards: Math.max(0, CW_int(meta.auto_include_cards || meta.autoincludecards, CW_DEFAULTS.autoIncludeCards)),
-    autoIncludeMinScore: Math.max(1, CW_num(meta.auto_include_min_score || meta.autoincludeminscore, CW_DEFAULTS.autoIncludeMinScore)),
-    autoIncludeDiversity: CW_bool(meta.auto_include_diversity || meta.autoincludediversity, CW_DEFAULTS.autoIncludeDiversity),
-    autoIncludeTypeCap: Math.max(1, CW_int(meta.auto_include_type_cap || meta.autoincludetypecap, CW_DEFAULTS.autoIncludeTypeCap)),
-    autoIncludeDedupe: CW_bool(meta.auto_include_dedupe || meta.autoincludededupe, CW_DEFAULTS.autoIncludeDedupe),
-    maxInjectChars: Math.max(1400, CW_int(meta.max_inject_chars || meta.maxinjectchars, CW_DEFAULTS.maxInjectChars)),
-    adaptiveContextBudget: CW_bool(meta.adaptive_context_budget || meta.adaptivecontextbudget, CW_DEFAULTS.adaptiveContextBudget),
-    maxContextShare: CW_clamp(CW_num(meta.max_context_share || meta.maxcontextshare, CW_DEFAULTS.maxContextShare), 0.05, 0.50),
-    minHistoryChars: Math.max(1000, CW_int(meta.min_history_chars || meta.minhistorychars, CW_DEFAULTS.minHistoryChars)),
-    maxCardChars: Math.max(250, CW_int(meta.max_card_chars || meta.maxcardchars, CW_DEFAULTS.maxCardChars)),
-    preservePlayerAgency: CW_bool(meta.preserve_player_agency || meta.preserveplayeragency, CW_DEFAULTS.preservePlayerAgency),
-    preserveEstablishedFacts: CW_bool(meta.preserve_established_facts || meta.preserveestablishedfacts, CW_DEFAULTS.preserveEstablishedFacts),
+    defaultMode: CW_mode(meta.default_mode || meta.defaultmode || base.defaultMode),
+    defaultRetries: Math.max(1, CW_int(meta.default_retries || meta.defaultretries, base.defaultRetries)),
+    strongCycles: Math.max(1, CW_int(meta.strong_cycles || meta.strongcycles, base.strongCycles)),
+    retryDelay: Math.max(0, CW_int(meta.retry_delay || meta.retrydelay, base.retryDelay)),
+    forceMaxAttempts: Math.max(1, CW_int(meta.force_max_attempts || meta.forcemaxattempts, base.forceMaxAttempts)),
 
-    foreshadow: CW_bool(meta.foreshadow, CW_DEFAULTS.foreshadow),
-    foreshadowLead: Math.max(0, CW_int(meta.foreshadow_lead || meta.foreshadowlead, CW_DEFAULTS.foreshadowLead)),
-    maxForeshadowEvents: Math.max(0, CW_int(meta.max_foreshadow_events || meta.maxforeshadowevents, CW_DEFAULTS.maxForeshadowEvents)),
+    maxIncludeCards: Math.max(0, CW_int(meta.max_include_cards || meta.maxincludecards, base.maxIncludeCards)),
+    autoInclude: CW_bool(meta.auto_include || meta.autoinclude, base.autoInclude),
+    autoIncludeCards: Math.max(0, CW_int(meta.auto_include_cards || meta.autoincludecards, base.autoIncludeCards)),
+    autoIncludeMinScore: Math.max(1, CW_num(meta.auto_include_min_score || meta.autoincludeminscore, base.autoIncludeMinScore)),
+    autoIncludeDiversity: CW_bool(meta.auto_include_diversity || meta.autoincludediversity, base.autoIncludeDiversity),
+    autoIncludeTypeCap: Math.max(1, CW_int(meta.auto_include_type_cap || meta.autoincludetypecap, base.autoIncludeTypeCap)),
+    autoIncludeDedupe: CW_bool(meta.auto_include_dedupe || meta.autoincludededupe, base.autoIncludeDedupe),
+    smartCardExtract: CW_bool(meta.smart_card_extract || meta.smartcardextract, base.smartCardExtract),
+    smartCardSentences: CW_clamp(CW_int(meta.smart_card_sentences || meta.smartcardsentences, base.smartCardSentences), 1, 12),
+    smartCardLeadChars: CW_clamp(CW_int(meta.smart_card_lead_chars || meta.smartcardleadchars, base.smartCardLeadChars), 0, 800),
+    maxInjectChars: Math.max(1400, CW_int(meta.max_inject_chars || meta.maxinjectchars, base.maxInjectChars)),
+    adaptiveContextBudget: CW_bool(meta.adaptive_context_budget || meta.adaptivecontextbudget, base.adaptiveContextBudget),
+    maxContextShare: CW_clamp(CW_num(meta.max_context_share || meta.maxcontextshare, base.maxContextShare), 0.05, 0.50),
+    minHistoryChars: Math.max(1000, CW_int(meta.min_history_chars || meta.minhistorychars, base.minHistoryChars)),
+    maxCardChars: Math.max(250, CW_int(meta.max_card_chars || meta.maxcardchars, base.maxCardChars)),
+    preservePlayerAgency: CW_bool(meta.preserve_player_agency || meta.preserveplayeragency, base.preservePlayerAgency),
+    preserveEstablishedFacts: CW_bool(meta.preserve_established_facts || meta.preserveestablishedfacts, base.preserveEstablishedFacts),
+
+    foreshadow: CW_bool(meta.foreshadow, base.foreshadow),
+    foreshadowLead: Math.max(0, CW_int(meta.foreshadow_lead || meta.foreshadowlead, base.foreshadowLead)),
+    maxForeshadowEvents: Math.max(0, CW_int(meta.max_foreshadow_events || meta.maxforeshadowevents, base.maxForeshadowEvents)),
 
     /* Franchise auto-builder. A plain franchise name is enough to start; the
        optional canon/source/range fields disambiguate properties with several
        continuities or adaptations. */
-    franchise: String(meta.franchise || meta.franchise_name || meta.franchisename || CW_DEFAULTS.franchise).replace(/^\s+|\s+$/g, ""),
-    franchiseCanon: String(meta.franchise_canon || meta.franchisecanon || meta.continuity || CW_DEFAULTS.franchiseCanon).replace(/^\s+|\s+$/g, ""),
-    franchiseStart: String(meta.franchise_start || meta.franchisestart || CW_DEFAULTS.franchiseStart).replace(/^\s+|\s+$/g, ""),
-    franchiseEnd: String(meta.franchise_end || meta.franchiseend || CW_DEFAULTS.franchiseEnd).replace(/^\s+|\s+$/g, ""),
-    franchiseRoute: String(meta.franchise_route || meta.franchiseroute || CW_DEFAULTS.franchiseRoute).replace(/^\s+|\s+$/g, ""),
-    franchiseAutoGenerate: CW_bool(meta.franchise_auto_generate || meta.franchiseautogenerate, CW_DEFAULTS.franchiseAutoGenerate),
-    franchiseTargetEvents: CW_clamp(CW_int(meta.franchise_event_count || meta.franchiseeventcount || meta.franchise_target_events || meta.franchisetargetevents, CW_DEFAULTS.franchiseTargetEvents), 1, 80),
-    franchiseBatchSize: CW_clamp(CW_int(meta.franchise_batch_size || meta.franchisebatchsize, CW_DEFAULTS.franchiseBatchSize), 1, 10),
-    franchiseBuildEvery: Math.max(1, CW_int(meta.franchise_build_every || meta.franchisebuildevery, CW_DEFAULTS.franchiseBuildEvery)),
-    franchiseMaxFailures: Math.max(1, CW_int(meta.franchise_max_failures || meta.franchisemaxfailures, CW_DEFAULTS.franchiseMaxFailures)),
-    franchiseMaterializeCards: CW_bool(meta.franchise_materialize_cards || meta.franchisematerializecards, CW_DEFAULTS.franchiseMaterializeCards),
-    franchiseCleanupOld: CW_bool(meta.franchise_cleanup_old || meta.franchisecleanupold, CW_DEFAULTS.franchiseCleanupOld),
-    franchiseEnforcement: CW_mode(meta.franchise_enforcement || meta.franchiseenforcement || CW_DEFAULTS.franchiseEnforcement) || CW_DEFAULTS.franchiseEnforcement,
-    franchiseDeadlinePolicy: CW_deadlinePolicy(meta.franchise_deadline_policy || meta.franchisedeadlinepolicy || CW_DEFAULTS.franchiseDeadlinePolicy) || CW_DEFAULTS.franchiseDeadlinePolicy,
-    franchisePacing: CW_franchisePacing(meta.franchise_pacing || meta.franchisepacing || CW_DEFAULTS.franchisePacing),
-    franchiseFirstEventAt: Math.max(0, CW_int(meta.franchise_first_event_at || meta.franchisefirsteventat, CW_DEFAULTS.franchiseFirstEventAt)),
-    franchiseAutoInclude: CW_bool(meta.franchise_auto_include || meta.franchiseautoinclude, CW_DEFAULTS.franchiseAutoInclude),
-    franchiseConfidenceFloor: CW_clamp(CW_num(meta.franchise_confidence_floor || meta.franchiseconfidencefloor, CW_DEFAULTS.franchiseConfidenceFloor), 0, 1),
-    franchiseSourceCards: CW_bool(meta.franchise_source_cards || meta.franchisesourcecards, CW_DEFAULTS.franchiseSourceCards),
-    franchiseSourceChars: CW_clamp(CW_int(meta.franchise_source_chars || meta.franchisesourcechars, CW_DEFAULTS.franchiseSourceChars), 0, 7000),
-    franchiseScope: String(meta.franchise_scope || meta.franchisescope || CW_DEFAULTS.franchiseScope).replace(/^\s+|\s+$/g, ""),
-    franchiseFiller: CW_franchiseFiller(meta.franchise_filler || meta.franchisefiller || CW_DEFAULTS.franchiseFiller),
-    franchiseGranularity: CW_franchiseGranularity(meta.franchise_granularity || meta.franchisegranularity || CW_DEFAULTS.franchiseGranularity),
-    franchiseEventPolicy: CW_franchiseEventPolicy(meta.franchise_event_policy || meta.franchiseeventpolicy || CW_DEFAULTS.franchiseEventPolicy),
-    franchiseAnchorThreshold: CW_clamp(CW_int(meta.franchise_anchor_threshold || meta.franchiseanchorthreshold, CW_DEFAULTS.franchiseAnchorThreshold), 1, 5),
-    franchiseRequireSourceRef: CW_bool(meta.franchise_require_source_ref || meta.franchiserequiresourceref, CW_DEFAULTS.franchiseRequireSourceRef),
-    franchiseRoadmapCard: CW_bool(meta.franchise_roadmap_card || meta.franchiseroadmapcard, CW_DEFAULTS.franchiseRoadmapCard),
-    franchiseRoadmapMaxChars: CW_clamp(CW_int(meta.franchise_roadmap_max_chars || meta.franchiseroadmapmaxchars, CW_DEFAULTS.franchiseRoadmapMaxChars), 700, 4000),
-    franchisePlannerHistory: CW_clamp(CW_int(meta.franchise_planner_history || meta.franchiseplannerhistory, CW_DEFAULTS.franchisePlannerHistory), 4, 40),
-    franchiseGeneratedProtect: CW_bool(meta.franchise_generated_protect || meta.franchisegeneratedprotect, CW_DEFAULTS.franchiseGeneratedProtect),
-    franchiseGeneratedBlockers: CW_bool(meta.franchise_generated_blockers || meta.franchisegeneratedblockers, CW_DEFAULTS.franchiseGeneratedBlockers),
-    franchiseSourceMode: CW_franchiseSourceMode(meta.franchise_source_mode || meta.franchisesourcemode || CW_DEFAULTS.franchiseSourceMode),
-    franchiseDependencyStrategy: CW_franchiseDependencyStrategy(meta.franchise_dependency_strategy || meta.franchisedependencystrategy || CW_DEFAULTS.franchiseDependencyStrategy),
-    franchiseDivergence: CW_franchiseDivergence(meta.franchise_divergence || meta.franchisedivergence || CW_DEFAULTS.franchiseDivergence),
-    franchisePlayerRole: CW_franchisePlayerRole(meta.franchise_player_role || meta.franchiseplayerrole || CW_DEFAULTS.franchisePlayerRole),
-    franchisePlannerMaxChars: CW_clamp(CW_int(meta.franchise_planner_max_chars || meta.franchiseplannermaxchars, CW_DEFAULTS.franchisePlannerMaxChars), 2600, 12000),
+    franchise: String(meta.franchise || meta.franchise_name || meta.franchisename || base.franchise).replace(/^\s+|\s+$/g, ""),
+    franchiseCanon: String(meta.franchise_canon || meta.franchisecanon || meta.continuity || base.franchiseCanon).replace(/^\s+|\s+$/g, ""),
+    franchiseStart: String(meta.franchise_start || meta.franchisestart || base.franchiseStart).replace(/^\s+|\s+$/g, ""),
+    franchiseEnd: String(meta.franchise_end || meta.franchiseend || base.franchiseEnd).replace(/^\s+|\s+$/g, ""),
+    franchiseRoute: String(meta.franchise_route || meta.franchiseroute || base.franchiseRoute).replace(/^\s+|\s+$/g, ""),
+    franchiseAutoGenerate: CW_bool(meta.franchise_auto_generate || meta.franchiseautogenerate, base.franchiseAutoGenerate),
+    franchiseTargetEvents: CW_clamp(CW_int(meta.franchise_event_count || meta.franchiseeventcount || meta.franchise_target_events || meta.franchisetargetevents, base.franchiseTargetEvents), 1, 80),
+    franchiseBatchSize: CW_clamp(CW_int(meta.franchise_batch_size || meta.franchisebatchsize, base.franchiseBatchSize), 1, 10),
+    franchiseBuildEvery: Math.max(1, CW_int(meta.franchise_build_every || meta.franchisebuildevery, base.franchiseBuildEvery)),
+    franchiseMaxFailures: Math.max(1, CW_int(meta.franchise_max_failures || meta.franchisemaxfailures, base.franchiseMaxFailures)),
+    franchiseMaterializeCards: CW_bool(meta.franchise_materialize_cards || meta.franchisematerializecards, base.franchiseMaterializeCards),
+    franchiseCleanupOld: CW_bool(meta.franchise_cleanup_old || meta.franchisecleanupold, base.franchiseCleanupOld),
+    franchiseEnforcement: CW_mode(meta.franchise_enforcement || meta.franchiseenforcement || base.franchiseEnforcement) || base.franchiseEnforcement,
+    franchiseDeadlinePolicy: CW_deadlinePolicy(meta.franchise_deadline_policy || meta.franchisedeadlinepolicy || base.franchiseDeadlinePolicy) || base.franchiseDeadlinePolicy,
+    franchisePacing: CW_franchisePacing(meta.franchise_pacing || meta.franchisepacing || base.franchisePacing),
+    franchiseFirstEventAt: Math.max(0, CW_int(meta.franchise_first_event_at || meta.franchisefirsteventat, base.franchiseFirstEventAt)),
+    franchiseAutoInclude: CW_bool(meta.franchise_auto_include || meta.franchiseautoinclude, base.franchiseAutoInclude),
+    franchiseConfidenceFloor: CW_clamp(CW_num(meta.franchise_confidence_floor || meta.franchiseconfidencefloor, base.franchiseConfidenceFloor), 0, 1),
+    franchiseSourceCards: CW_bool(meta.franchise_source_cards || meta.franchisesourcecards, base.franchiseSourceCards),
+    franchiseSourceChars: CW_clamp(CW_int(meta.franchise_source_chars || meta.franchisesourcechars, base.franchiseSourceChars), 0, 7000),
+    franchiseScope: String(meta.franchise_scope || meta.franchisescope || base.franchiseScope).replace(/^\s+|\s+$/g, ""),
+    franchiseFiller: CW_franchiseFiller(meta.franchise_filler || meta.franchisefiller || base.franchiseFiller),
+    franchiseGranularity: CW_franchiseGranularity(meta.franchise_granularity || meta.franchisegranularity || base.franchiseGranularity),
+    franchiseEventPolicy: CW_franchiseEventPolicy(meta.franchise_event_policy || meta.franchiseeventpolicy || base.franchiseEventPolicy),
+    franchiseAnchorThreshold: CW_clamp(CW_int(meta.franchise_anchor_threshold || meta.franchiseanchorthreshold, base.franchiseAnchorThreshold), 1, 5),
+    franchiseRequireSourceRef: CW_bool(meta.franchise_require_source_ref || meta.franchiserequiresourceref, base.franchiseRequireSourceRef),
+    franchiseRoadmapCard: CW_bool(meta.franchise_roadmap_card || meta.franchiseroadmapcard, base.franchiseRoadmapCard),
+    franchiseRoadmapMaxChars: CW_clamp(CW_int(meta.franchise_roadmap_max_chars || meta.franchiseroadmapmaxchars, base.franchiseRoadmapMaxChars), 700, 4000),
+    franchisePlannerHistory: CW_clamp(CW_int(meta.franchise_planner_history || meta.franchiseplannerhistory, base.franchisePlannerHistory), 4, 40),
+    franchiseGeneratedProtect: CW_bool(meta.franchise_generated_protect || meta.franchisegeneratedprotect, base.franchiseGeneratedProtect),
+    franchiseGeneratedBlockers: CW_bool(meta.franchise_generated_blockers || meta.franchisegeneratedblockers, base.franchiseGeneratedBlockers),
+    franchiseSourceMode: CW_franchiseSourceMode(meta.franchise_source_mode || meta.franchisesourcemode || base.franchiseSourceMode),
+    franchiseDependencyStrategy: CW_franchiseDependencyStrategy(meta.franchise_dependency_strategy || meta.franchisedependencystrategy || base.franchiseDependencyStrategy),
+    franchiseDivergence: CW_franchiseDivergence(meta.franchise_divergence || meta.franchisedivergence || base.franchiseDivergence),
+    franchisePlayerRole: CW_franchisePlayerRole(meta.franchise_player_role || meta.franchiseplayerrole || base.franchisePlayerRole),
+    franchisePlannerMaxChars: CW_clamp(CW_int(meta.franchise_planner_max_chars || meta.franchiseplannermaxchars, base.franchisePlannerMaxChars), 2600, 12000),
+    franchisePlannerNonce: CW_bool(meta.franchise_planner_nonce || meta.franchiseplannernonce, base.franchisePlannerNonce),
+    franchiseSourceFilterStrict: CW_bool(meta.franchise_source_filter_strict || meta.franchisesourcefilterstrict, base.franchiseSourceFilterStrict),
+    franchiseRebuildOnSourceChange: CW_bool(meta.franchise_rebuild_on_source_change || meta.franchiserebuildonsourcechange, base.franchiseRebuildOnSourceChange),
+    franchiseBuildMode: CW_franchiseBuildMode(meta.franchise_build_mode || meta.franchisebuildmode || base.franchiseBuildMode),
+    franchiseDeliveryPolicy: CW_deliveryMode(meta.franchise_delivery_policy || meta.franchisedeliverypolicy || base.franchiseDeliveryPolicy) || "adaptive",
+    franchiseOutcomePolicy: CW_outcomePolicy(meta.franchise_outcome_policy || meta.franchiseoutcomepolicy || base.franchiseOutcomePolicy) || "adaptive",
 
-    validateGraph: CW_bool(meta.validate_graph || meta.validategraph, CW_DEFAULTS.validateGraph),
-    dashboard: CW_bool(meta.dashboard, CW_DEFAULTS.dashboard),
-    dashboardEvery: Math.max(1, CW_int(meta.dashboard_every || meta.dashboardevery, CW_DEFAULTS.dashboardEvery)),
-    debug: CW_bool(meta.debug, CW_DEFAULTS.debug)
+    validateGraph: CW_bool(meta.validate_graph || meta.validategraph, base.validateGraph),
+    dashboard: CW_bool(meta.dashboard, base.dashboard),
+    dashboardEvery: Math.max(1, CW_int(meta.dashboard_every || meta.dashboardevery, base.dashboardEvery)),
+    debug: CW_bool(meta.debug, base.debug)
   };
 
   CW_state().debug = cfg.debug;
@@ -1075,6 +1180,9 @@ function CW_applyEventDefaults(e, cfg) {
   }
   if (!e.lead) e.lead = cfg.foreshadowLead;
   if (e.autoInclude === null) e.autoInclude = cfg.autoInclude;
+  if (!e.delivery) e.delivery = "adaptive";
+  if (!e.outcomePolicy) e.outcomePolicy = "flexible";
+  if (!e.playerPresence) e.playerPresence = "optional";
   return e;
 }
 
@@ -1082,71 +1190,56 @@ function CW_applyEventDefaults(e, cfg) {
  * EVIDENCE / MATCHING
  * ====================================================================== */
 
-function CW_observeText(events, text, source, cfg) {
-  text = String(text || "");
-  if (!text) return;
-
-  var registry = {};
-  var i, x, e, key;
-
+function CW_buildEvidenceRegistry(events, cfg) {
+  if (events && events._cwEvidenceRegistry) return events._cwEvidenceRegistry;
+  var registry = {}, i, x, e, key;
   function addTerms(list, matchMode, permanent) {
     for (x = 0; x < list.length; x++) {
-      var term = list[x];
-      var ek = CW_evidenceKey(term, matchMode);
+      var term = list[x], ek = CW_evidenceKey(term, matchMode);
       if (!registry[ek]) registry[ek] = { term:term, mode:matchMode, permanent:!!permanent };
       else if (permanent) registry[ek].permanent = true;
     }
   }
-
   function addClauses(groups, matchMode, permanent) {
     var a, b;
     for (a = 0; a < groups.length; a++) for (b = 0; b < groups[a].length; b++) {
-      var term = groups[a][b];
-      var ek = CW_evidenceKey(term, matchMode);
+      var term = groups[a][b], ek = CW_evidenceKey(term, matchMode);
       if (!registry[ek]) registry[ek] = { term:term, mode:matchMode, permanent:!!permanent };
       else if (permanent) registry[ek].permanent = true;
     }
   }
-
   for (i = 0; i < events.length; i++) {
     e = CW_applyEventDefaults(events[i], cfg);
-    addTerms(e.requireAll, e.matchMode, false);
-    addTerms(e.requireAny, e.matchMode, false);
+    addTerms(e.requireAll, e.matchMode, false); addTerms(e.requireAny, e.matchMode, false);
     addClauses(e.requireClauses, e.matchMode, false);
-    addTerms(e.completeAny, e.completionMatch, false);
-    addTerms(e.completeAll, e.completionMatch, false);
-    addClauses(e.completeClauses, e.completionMatch, false);
-    addTerms(e.progress, e.completionMatch, false);
+    addTerms(e.completeAny, e.completionMatch, false); addTerms(e.completeAll, e.completionMatch, false);
+    addClauses(e.completeClauses, e.completionMatch, false); addTerms(e.progress, e.completionMatch, false);
     addTerms(e.unlessEver, e.blockerMatch, true);
   }
+  try { events._cwEvidenceRegistry = registry; } catch (ignore) {}
+  return registry;
+}
 
-  var s = CW_state();
-  var src = source || "unknown";
+function CW_observeText(events, text, source, cfg) {
+  text = String(text || "");
+  if (!text) return;
+  var registry = CW_buildEvidenceRegistry(events, cfg);
+  var s = CW_state(), src = source || "unknown", key;
   for (key in registry) {
     if (!registry.hasOwnProperty(key)) continue;
     var rr = registry[key];
     if (!CW_textMatchesTerm(text, rr.term, rr.mode, cfg)) continue;
-
-    var old = s.seen[key];
-    var timeline = [];
+    var old = s.seen[key], timeline = [];
     if (old && old.timeline && Object.prototype.toString.call(old.timeline) === "[object Array]") timeline = old.timeline.slice(0);
     else if (old) timeline.push({ turn:CW_seenTurn(old), source:old.source || "legacy" });
-
     var duplicate = false, z;
     for (z = timeline.length - 1; z >= 0 && z >= timeline.length - 4; z--) {
       if (timeline[z] && timeline[z].turn === (s.turn || 0) && timeline[z].source === src) { duplicate = true; break; }
     }
     if (!duplicate) timeline.push({ turn:s.turn || 0, source:src });
     if (timeline.length > 24) timeline.splice(0, timeline.length - 24);
-
     var last = timeline[timeline.length - 1] || {turn:s.turn || 0,source:src};
-    s.seen[key] = {
-      turn:last.turn,
-      hits:timeline.length,
-      source:last.source,
-      permanent:!!rr.permanent || !!(old && old.permanent),
-      timeline:timeline
-    };
+    s.seen[key] = { turn:last.turn, hits:timeline.length, source:last.source, permanent:!!rr.permanent || !!(old && old.permanent), timeline:timeline };
   }
 }
 
@@ -1281,6 +1374,12 @@ function CW_anyInText(terms, text, mode, cfg) {
   return false;
 }
 
+function CW_countInText(terms, text, mode, cfg) {
+  var hit = 0, i;
+  for (i = 0; i < terms.length; i++) if (CW_textMatchesTerm(text, terms[i], mode, cfg)) hit += 1;
+  return hit;
+}
+
 function CW_allInText(terms, text, mode, cfg) {
   var i;
   for (i = 0; i < terms.length; i++) if (!CW_textMatchesTerm(text, terms[i], mode, cfg)) return false;
@@ -1413,8 +1512,13 @@ function CW_selectEvent(events, cfg) {
   for (i = 0; i < events.length; i++) {
     var e = CW_applyEventDefaults(events[i], cfg);
     var check = CW_eligibility(e, scene, events, cfg, false);
+    var es = CW_eventState(e.id);
     if (check.ok) {
+      if (!es.eligibleSince) es.eligibleSince = s.turn;
+      es.lastEligibleTurn = s.turn;
       candidates.push({ event: e, score: CW_eventScore(e, check, cfg) });
+    } else if (check.why !== "global-cooldown" && check.why !== "event-cooldown" && check.why !== "repeat-wait" && check.why !== "backoff") {
+      es.eligibleSince = 0;
     }
   }
 
@@ -1488,7 +1592,7 @@ function CW_eligibility(e, scene, events, cfg, foreshadowOnly) {
   if (e.sceneUnless.length && CW_anyInText(e.sceneUnless, scene, e.blockerMatch, cfg)) return {ok:false,why:"scene-unless"};
 
   if (!forceDeadline) {
-    if (e.whenAny.length && !CW_anyInText(e.whenAny, scene, e.matchMode, cfg)) return {ok:false,why:"when-any"};
+    if (e.whenAny.length && CW_countInText(e.whenAny, scene, e.matchMode, cfg) < Math.min(e.whenMin, e.whenAny.length)) return {ok:false,why:"when-min"};
     if (e.whenAll.length && !CW_allInText(e.whenAll, scene, e.matchMode, cfg)) return {ok:false,why:"when-all"};
     if (e.whenClauses.length && !CW_allClauseGroupsInText(e.whenClauses, scene, e.matchMode, cfg)) return {ok:false,why:"when-clauses"};
   }
@@ -1608,7 +1712,39 @@ function CW_eventScore(e, check, cfg) {
   score += Math.min(1500, age * 10);
   if (check.forced) score += 10000;
   if (e.mode === "force") score += 250;
+  if (cfg.fairScheduler) {
+    var es = CW_eventState(e.id);
+    var waited = es.eligibleSince ? Math.max(0, s.turn - es.eligibleSince) : 0;
+    if (waited >= cfg.starvationTurns) score += Math.min(9000, cfg.starvationBoost + (waited - cfg.starvationTurns) * 140);
+  }
   return score;
+}
+
+function CW_selectPreemptor(events, active, cfg) {
+  if (!active || active.mode === "force") return null;
+  var scene = CW_recentSceneText(cfg.sceneActions), best = null, bestScore = -1, i;
+  var activeScore = active.priority * 100;
+  for (i = 0; i < events.length; i++) {
+    var e = CW_applyEventDefaults(events[i], cfg);
+    if (e.id === active.id) continue;
+    var check = CW_eligibility(e, scene, events, cfg, false);
+    if (!check.ok || (!check.forced && e.mode !== "force")) continue;
+    if ((e.priority - active.priority) < cfg.preemptPriorityGap && !check.forced) continue;
+    var sc = CW_eventScore(e, check, cfg);
+    if (sc > bestScore && sc > activeScore + cfg.preemptPriorityGap * 100) { best = e; bestScore = sc; }
+  }
+  return best;
+}
+
+function CW_preemptActive(active, incoming, cfg) {
+  var s = CW_state(), aes = CW_eventState(active.id);
+  aes.status = "cooldown";
+  aes.nextEligibleTurn = Math.max(aes.nextEligibleTurn || 0, s.turn + 1);
+  aes.preemptions = (aes.preemptions || 0) + 1;
+  aes.lastReason = "preempted-by:" + incoming.id;
+  s.activeId = null; s.active = null;
+  CW_activate(incoming, cfg);
+  CW_log("Preempted " + active.id + " for urgent event " + incoming.id);
 }
 
 function CW_activate(e, cfg) {
@@ -1738,7 +1874,15 @@ function CW_eventCompleted(e, output, cfg) {
   }
 
   if (e.completeAll.length || e.completeClauses.length) return true;
-  if (e.completeAny.length && CW_anyInText(e.completeAny, output, e.completionMatch, cfg)) return true;
+  if (e.completeAny.length) {
+    var minNeed = Math.min(Math.max(1, e.completeMin || 1), e.completeAny.length);
+    var hits = 0;
+    for (i = 0; i < e.completeAny.length; i++) {
+      k = CW_evidenceKey(e.completeAny[i], e.completionMatch); t = led[k];
+      if (typeof t === "number" && (s.turn - t) < e.completeWithin) hits += 1;
+    }
+    if (hits >= minNeed) return true;
+  }
   if (!e.completeAny.length && !e.completeAll.length && !e.completeClauses.length && !e.completeRegex) return true;
   return false;
 }
@@ -1837,12 +1981,14 @@ function CW_buildActiveInjection(e, cards, cfg) {
   lines.push("Pressure: " + urgency.label + ". " + urgency.instruction);
 
   if (e.bridge) lines.push("Bridge: " + e.bridge);
+  lines.push("Delivery: " + CW_deliveryInstruction(e.delivery, e.playerPresence));
+  lines.push("Outcome policy: " + CW_outcomeInstruction(e.outcomePolicy));
   if (e.generatedRole) lines.push("Franchise player-role mode: " + e.generatedRole + ". Preserve agency even when the player occupies a source-canon role.");
   if (e.protect.length) lines.push("Protected continuity: " + e.protect.join("; "));
   if (e.forbid.length) lines.push("Do NOT establish: " + e.forbid.join("; "));
 
   if (e.completeAll.length) lines.push("Completion evidence required (ALL, may span " + e.completeWithin + " action(s)): " + e.completeAll.join("; "));
-  else if (e.completeAny.length) lines.push("Completion evidence required (ANY): " + e.completeAny.join("; "));
+  else if (e.completeAny.length) lines.push("Completion evidence required (" + Math.min(e.completeMin, e.completeAny.length) + " of " + e.completeAny.length + ", may span " + e.completeWithin + " action(s)): " + e.completeAny.join("; "));
 
   if (e.completeClauses.length) lines.push("Completion clauses: satisfy one alternative from EACH group: " + CW_clauseGroupsText(e.completeClauses));
   if (e.progress.length && es.progressHits === 0) lines.push("Useful progress signals: " + e.progress.join("; "));
@@ -1884,7 +2030,7 @@ function CW_resolveSupportingCards(e, cards, scene, cfg) {
     for (j = 0; j < cards.length; j++) {
       var c = cards[j] || {};
       if (String(c.id) === String(e.cardId) || used[String(c.id)] || CW_isControlCard(c) || CW_cardExcluded(e, c)) continue;
-      if (CW_cardMatchesRef(c, ref)) { CW_pushSupport(out, used, c, cfg, entryHashes); break; }
+      if (CW_cardMatchesRef(c, ref)) { CW_pushSupport(out, used, c, cfg, entryHashes, false, e.payload + " " + e.title); break; }
     }
   }
 
@@ -1920,7 +2066,7 @@ function CW_resolveSupportingCards(e, cards, scene, cfg) {
       types[t] = true;
       var dt = CW_normText(ranked[i].card.type || "other");
       if ((autoTypeCounts[dt] || 0) >= cfg.autoIncludeTypeCap) continue;
-      if (!CW_pushSupport(out, used, ranked[i].card, cfg, entryHashes, true)) continue;
+      if (!CW_pushSupport(out, used, ranked[i].card, cfg, entryHashes, true, query)) continue;
       autoTypeCounts[dt] = (autoTypeCounts[dt] || 0) + 1;
       picked += 1;
     }
@@ -1930,7 +2076,7 @@ function CW_resolveSupportingCards(e, cards, scene, cfg) {
     if (used[String(ranked[i].card.id)]) continue;
     var at = CW_normText(ranked[i].card.type || "other");
     if ((autoTypeCounts[at] || 0) >= cfg.autoIncludeTypeCap) continue;
-    if (!CW_pushSupport(out, used, ranked[i].card, cfg, entryHashes, true)) continue;
+    if (!CW_pushSupport(out, used, ranked[i].card, cfg, entryHashes, true, query)) continue;
     autoTypeCounts[at] = (autoTypeCounts[at] || 0) + 1;
     picked += 1;
   }
@@ -1938,9 +2084,10 @@ function CW_resolveSupportingCards(e, cards, scene, cfg) {
   return out;
 }
 
-function CW_pushSupport(out, used, card, cfg, entryHashes, isAuto) {
+function CW_pushSupport(out, used, card, cfg, entryHashes, isAuto, query) {
   var entry = String(card.entry || "").replace(/^\s+|\s+$/g, "");
   if (!entry) return false;
+  if (isAuto && cfg.smartCardExtract) entry = CW_extractRelevantCardEntry(entry, query || "", cfg);
   if (entry.length > cfg.maxCardChars) entry = entry.slice(0, cfg.maxCardChars) + "…";
 
   entryHashes = entryHashes || {};
@@ -1955,6 +2102,63 @@ function CW_pushSupport(out, used, card, cfg, entryHashes, isAuto) {
   used[String(card.id)] = true;
   entryHashes[eh] = true;
   return true;
+}
+
+function CW_extractRelevantCardEntry(entry, query, cfg) {
+  entry = String(entry || "").replace(/^\s+|\s+$/g, "");
+  if (!entry || entry.length <= cfg.maxCardChars) return entry;
+  var lead = cfg.smartCardLeadChars > 0 ? entry.slice(0, cfg.smartCardLeadChars).replace(/\s+$/g, "") : "";
+  var sentences = entry.match(/[^.!?\n]+(?:[.!?]+|$)/g) || [entry];
+  var qs = CW_tokenSet(query || ""), ranked = [], i, j;
+  for (i = 0; i < sentences.length; i++) {
+    var sentence = String(sentences[i] || "").replace(/^\s+|\s+$/g, "");
+    if (!sentence || sentence.length < 18) continue;
+    var toks = CW_contentTokens(sentence), hit = 0;
+    for (j = 0; j < toks.length; j++) if (qs[toks[j]]) hit += 1;
+    var score = hit * 5 + (i === 0 ? 3 : 0) - Math.min(3, sentence.length / 500);
+    if (hit > 0 || i === 0) ranked.push({i:i, text:sentence, score:score});
+  }
+  ranked.sort(function(a,b){ if (a.score !== b.score) return b.score-a.score; return a.i-b.i; });
+  ranked = ranked.slice(0, Math.max(1, cfg.smartCardSentences));
+  ranked.sort(function(a,b){ return a.i-b.i; });
+  var parts = [], seen = {};
+  if (lead) { parts.push(lead); seen[CW_normText(lead)] = true; }
+  for (i = 0; i < ranked.length; i++) {
+    var k = CW_normText(ranked[i].text);
+    if (!seen[k]) { parts.push(ranked[i].text); seen[k] = true; }
+  }
+  var out = parts.join(" ").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
+  return out || entry.slice(0, cfg.maxCardChars);
+}
+
+function CW_deliveryMode(v) {
+  v = CW_norm(v || "");
+  if (v === "scene" || v === "world" || v === "offscreen" || v === "adaptive") return v;
+  return "";
+}
+function CW_outcomePolicy(v) {
+  v = CW_norm(v || "");
+  if (v === "fixed" || v === "flexible" || v === "opportunity" || v === "adaptive") return v;
+  return "";
+}
+function CW_playerPresence(v) {
+  v = CW_norm(v || "");
+  if (v === "required" || v === "optional" || v === "none") return v;
+  return "";
+}
+function CW_deliveryInstruction(mode, presence) {
+  mode = mode || "adaptive"; presence = presence || "optional";
+  var p = presence === "required" ? "The player must be able to witness/participate, but do not teleport or puppet them; bridge them there through world circumstances." : (presence === "none" ? "Do not require the player's physical presence; the event may occur through the canon cast/world and reach the player through consequences." : "Player presence is optional; use whichever presentation best fits established location and agency.");
+  if (mode === "offscreen") return "Offscreen/world consequence permitted. " + p;
+  if (mode === "world") return "Treat this as a world event that can progress regardless of the player's exact location. " + p;
+  if (mode === "scene") return "Keep the beat in the current/on-screen scene when logically possible. " + p;
+  return "Adapt presentation to the current adventure instead of teleporting the player. " + p;
+}
+function CW_outcomeInstruction(mode) {
+  if (mode === "fixed") return "Preserve the required world-side canon outcome unless established facts make it impossible; never force an unchosen player decision to obtain it.";
+  if (mode === "opportunity") return "Preserve the canon opportunity, pressure or confrontation, but leave the player's decision and resulting branch genuinely open.";
+  if (mode === "adaptive") return "Preserve the source event's narrative function, adapting participants/details/outcome when legitimate player-caused divergence requires it.";
+  return "Preserve the core canon beat while allowing details and consequences to adapt to established play.";
 }
 
 function CW_cardRelevance(card, query, cfg) {
@@ -2030,7 +2234,7 @@ function CW_typeAllowed(type, allowed) {
 
 function CW_isControlCard(c) {
   var t = CW_norm(c.type || "");
-  return t === "canon event" || t === "canon" || t === "canon config" || t === "canon weave config" || t === "canon dashboard" || t === "canon roadmap" || CW_firstMarker(c.entry || "") !== "";
+  return t === "canon event" || t === "canon" || t === "canon config" || t === "canon weave config" || t === "canon dashboard" || t === "canon roadmap" || t === "canon source" || t === "franchise source" || t === "source canon" || CW_firstMarker(c.entry || "") !== "";
 }
 
 function CW_limitInjection(lines, limit) {
@@ -2146,7 +2350,19 @@ function CW_ensureFranchiseState(s) {
   if (typeof f.lastAnchorId !== "string") f.lastAnchorId = "";
   if (typeof f.lastStableId !== "string") f.lastStableId = "";
   if (typeof f.lastSourceModeNotice !== "string") f.lastSourceModeNotice = "";
+  if (typeof f.planNonce !== "string") f.planNonce = "";
+  if (typeof f.sourceHash !== "string") f.sourceHash = "";
+  if (typeof f.sourceChanged !== "boolean") f.sourceChanged = false;
+  if (typeof f.manualBuildRequested !== "boolean") f.manualBuildRequested = false;
+  if (typeof f.lastSourceChangeNotice !== "string") f.lastSourceChangeNotice = "";
   return f;
+}
+
+function CW_franchiseBuildMode(v) {
+  v = CW_norm(v || "steady");
+  if (v === "frontload" || v === "fast") return "frontload";
+  if (v === "manual" || v === "off") return "manual";
+  return "steady";
 }
 
 function CW_franchisePacing(v) {
@@ -2248,7 +2464,9 @@ function CW_franchiseIdentity(cfg) {
     CW_norm(cfg.franchiseSourceMode),
     CW_norm(cfg.franchiseDependencyStrategy),
     CW_norm(cfg.franchiseDivergence),
-    CW_norm(cfg.franchisePlayerRole)
+    CW_norm(cfg.franchisePlayerRole),
+    CW_norm(cfg.franchiseDeliveryPolicy),
+    CW_norm(cfg.franchiseOutcomePolicy)
   ].join("|");
 }
 
@@ -2256,6 +2474,9 @@ function CW_applyFranchiseConfig(parsed, cfg) {
   var s = CW_state();
   var f = CW_ensureFranchiseState(s);
   var identity = CW_franchiseIdentity(cfg);
+  var sourceHash = CW_franchiseSourceSignature(parsed, cfg);
+  var identityWithSource = identity;
+  if (cfg.franchiseSourceMode !== "ignore" && sourceHash) identityWithSource += "|source:" + sourceHash;
 
   if (!identity) {
     f.status = "disabled";
@@ -2266,11 +2487,22 @@ function CW_applyFranchiseConfig(parsed, cfg) {
 
   f.target = cfg.franchiseTargetEvents;
 
-  if (f.identity !== identity) {
+  if (f.identity && identity && f.identity !== identityWithSource && f.sourceHash && sourceHash && f.sourceHash !== sourceHash && !cfg.franchiseRebuildOnSourceChange && f.generated > 0) {
+    f.sourceChanged = true;
+    f.paused = true;
+    f.status = "source_changed";
+    f.lastReason = "canon-source-changed";
+    f.sourceHash = sourceHash;
+    f.identity = identityWithSource;
+    if (f.lastSourceChangeNotice !== sourceHash) {
+      f.lastSourceChangeNotice = sourceHash;
+      CW_toast("Canon Weave: Canon Source changed. Existing roadmap kept safe; use /canon franchise rebuild after reviewing it.");
+    }
+  } else if (f.identity !== identityWithSource) {
     if (cfg.franchiseCleanupOld) CW_removeGeneratedFranchiseCards();
 
     f.session += 1;
-    f.identity = identity;
+    f.identity = identityWithSource;
     f.name = cfg.franchise;
     f.activeSet = CW_slug(cfg.franchise) + "_" + String(f.session) + "_" + CW_hash(identity).slice(0, 6);
     f.status = cfg.franchiseAutoGenerate ? "building" : "ready";
@@ -2285,6 +2517,8 @@ function CW_applyFranchiseConfig(parsed, cfg) {
     f.complete = false;
     f.paused = false;
     f.lastReason = "new-franchise";
+    f.sourceHash = sourceHash;
+    f.sourceChanged = false;
     f.cursor = "";
     f.sourceRefs = [];
     f.suggestions = [];
@@ -2293,6 +2527,7 @@ function CW_applyFranchiseConfig(parsed, cfg) {
     f.lastAnchorId = "";
     f.lastStableId = "";
     f.lastSourceModeNotice = "";
+    f.planNonce = "";
     f.roadmapKey = "%CW:ROADMAP:" + f.activeSet + "%";
     CW_toast("Canon Weave: preparing canon roadmap for " + cfg.franchise + ".");
   }
@@ -2324,8 +2559,10 @@ function CW_applyFranchiseConfig(parsed, cfg) {
 
   if (f.generated >= f.target) {
     f.complete = true;
-    f.status = "ready";
-  } else if (!f.paused && cfg.franchiseAutoGenerate && f.status !== "uncertain" && f.status !== "needs_continuity" && f.status !== "needs_source" && f.status !== "failed") {
+    /* Source changes are a review state, not a build-progress state. Keep the
+       warning visible even when the old roadmap already met its event target. */
+    if (!f.sourceChanged && f.status !== "source_changed") f.status = "ready";
+  } else if (!f.paused && cfg.franchiseAutoGenerate && f.status !== "uncertain" && f.status !== "needs_continuity" && f.status !== "needs_source" && f.status !== "source_changed" && f.status !== "failed") {
     f.status = "building";
   }
 }
@@ -2361,6 +2598,7 @@ function CW_shouldBuildFranchise(cfg) {
   var f = CW_ensureFranchiseState(s);
 
   if (!cfg.franchise || !cfg.franchiseAutoGenerate) return false;
+  if (cfg.franchiseBuildMode === "manual" && !f.manualBuildRequested) return false;
   if (f.paused || f.complete || f.status === "uncertain" || f.status === "needs_continuity" || f.status === "needs_source" || f.status === "failed") return false;
   if (f.generated >= f.target) return false;
   if (f.failures >= cfg.franchiseMaxFailures) {
@@ -2368,7 +2606,8 @@ function CW_shouldBuildFranchise(cfg) {
     f.lastReason = "planner-failure-limit";
     return false;
   }
-  if ((s.turn - f.lastPlanTurn) < cfg.franchiseBuildEvery) return false;
+  var every = cfg.franchiseBuildMode === "frontload" ? 1 : cfg.franchiseBuildEvery;
+  if ((s.turn - f.lastPlanTurn) < every) return false;
   /* Never generate two roadmaps for the same output action. Retries at that
      action can still regenerate story text without multiplying cards. */
   if (f.lastCapturedAction === s.turn) return false;
@@ -2396,6 +2635,8 @@ function CW_buildFranchisePlannerInjection(parsed, cfg) {
   if (batch <= 0) return "";
 
   f.lastPlanTurn = s.turn;
+  f.planNonce = cfg.franchisePlannerNonce ? CW_hash(f.activeSet + "|" + String(s.turn) + "|" + String(f.batches) + "|" + String(f.generated)) : "";
+  f.manualBuildRequested = false;
 
   var previous = [];
   var start = Math.max(0, f.titles.length - cfg.franchisePlannerHistory);
@@ -2405,7 +2646,8 @@ function CW_buildFranchisePlannerInjection(parsed, cfg) {
   var lines = [];
   lines.push("\n\n[CANON WEAVE — BACKGROUND FRANCHISE ROADMAP BUILDER]");
   lines.push("This is a hidden machine task performed alongside the NORMAL story continuation. Do NOT replace, shorten, summarize, or derail the story response because of this task.");
-  lines.push("After the normal story response, append exactly one <CW_FRANCHISE_PLAN> JSON block. The Output script will remove that block before the player sees it.");
+  lines.push("After the normal story response, append exactly one franchise-plan JSON block. The Output script will remove that block before the player sees it.");
+  if (f.planNonce) lines.push("Planner nonce: " + f.planNonce + ". The block MUST use this exact nonce so stray story text cannot be mistaken for machine data.");
   lines.push("Franchise: " + cfg.franchise);
   if (cfg.franchiseCanon) lines.push("Continuity/adaptation: " + cfg.franchiseCanon);
   if (cfg.franchiseStart) lines.push("Start boundary: " + cfg.franchiseStart);
@@ -2432,81 +2674,101 @@ function CW_buildFranchisePlannerInjection(parsed, cfg) {
   if (cfg.franchiseDivergence === "adaptive") lines.push("Adaptive divergence policy: preserve backbone outcomes, but rewrite bridges and participants around legitimate player-caused changes. Mark impossible events with specific blockers so later backbone events can continue.");
   if (cfg.franchiseDivergence === "reactive") lines.push("Reactive divergence policy: player-created consequences outrank source imitation. Keep canon opportunities, but make route-dependent or contradicted beats soft/skip-safe rather than forcing a retcon.");
   lines.push("JSON schema (valid JSON only, no markdown fence):");
-  lines.push('{"status":"ok|uncertain|needs_continuity","reason":"","continuity_options":["option"],"cursor":"next source position","complete":false,"batch_summary":"short summary","events":[{"id":"short_unique_id","title":"Event title","arc":"arc_name","kind":"anchor|major|minor|conditional","hard_canon":false,"source_ref":"season/episode/chapter/mission/arc if known","importance":1,"confidence":0.9,"when":["concrete scene cue"],"complete":["observable outcome phrase"],"support":["exact character/location/item names"],"blockers":["specific outcome making this beat impossible"],"protect":["continuity fact to preserve"],"forbid":["retcon/outcome to avoid"],"seed":"brief foreshadow setup","bridge":"world-side route into this beat if the player diverges","body":"2-4 sentence canon-event summary"}]}');
+  lines.push('{"protocol":"CW1","nonce":"' + (f.planNonce || '') + '","status":"ok|uncertain|needs_continuity","reason":"","continuity_options":["option"],"cursor":"next source position","complete":false,"batch_summary":"short summary","events":[{"id":"short_unique_id","title":"Event title","arc":"arc_name","kind":"anchor|major|minor|conditional","hard_canon":false,"source_ref":"season/episode/chapter/mission/arc if known","importance":1,"confidence":0.9,"delivery":"adaptive|scene|world|offscreen","outcome":"fixed|flexible|opportunity|adaptive","player_presence":"required|optional|none","when":["concrete scene cue"],"complete":["observable outcome phrase"],"support":["exact character/location/item names"],"blockers":["specific outcome making this beat impossible"],"protect":["continuity fact to preserve"],"forbid":["retcon/outcome to avoid"],"seed":"brief foreshadow setup","bridge":"world-side route into this beat if the player diverges","body":"2-4 sentence canon-event summary"}]}');
   lines.push("importance is 1-5 and confidence is 0-1. Use kind=anchor only for true backbone events. hard_canon=true only when the event must occur in the selected continuity rather than being route/choice dependent. Keep IDs lowercase/simple. Return events in source chronology. Set complete=true only when the configured end boundary is reached or there are no more qualifying events in scope.");
 
   if (source && cfg.franchiseSourceMode !== "ignore") {
-    lines.push("Creator-provided Canon Source Story Cards override uncertain memory when they conflict:");
+    lines.push(cfg.franchiseSourceMode === "require" ? "Creator-provided Canon Source Story Cards are the authoritative generation boundary: do not create events unsupported by this supplied source material." : "Creator-provided Canon Source Story Cards override uncertain memory when they conflict:");
     lines.push(source);
   }
 
   lines.push("Append the block at the very END of the normal story response:");
-  lines.push("<CW_FRANCHISE_PLAN>{...valid JSON...}</CW_FRANCHISE_PLAN>");
+  lines.push(f.planNonce ? ("<CW_FRANCHISE_PLAN nonce=\"" + f.planNonce + "\">{...valid JSON...}</CW_FRANCHISE_PLAN>") : "<CW_FRANCHISE_PLAN>{...valid JSON...}</CW_FRANCHISE_PLAN>");
   lines.push("[END CANON WEAVE FRANCHISE BUILDER]");
   return CW_limitInjection(lines, cfg.franchisePlannerMaxChars);
+}
+
+function CW_parseCanonSourceCard(card) {
+  var entry = String((card || {}).entry || ""), parsed = {meta:{}, body:entry};
+  if (CW_norm(entry.split(/\r?\n/)[0] || "") === "@canon_source") parsed = CW_parseMetaBlock(entry, "@canon_source");
+  return { meta:parsed.meta || {}, body:String(parsed.body || "").replace(/^\s+|\s+$/g, "") };
+}
+
+function CW_sourceCardMatches(src, cfg) {
+  var m = src.meta || {}, f = CW_norm(m.franchise || m.property || ""), c = CW_norm(m.continuity || m.canon || "");
+  if (f && cfg.franchise && f !== CW_norm(cfg.franchise)) return false;
+  if (c && cfg.franchiseCanon && c !== CW_norm(cfg.franchiseCanon)) {
+    if (cfg.franchiseSourceFilterStrict) return false;
+    if (CW_norm(cfg.franchiseCanon).indexOf(c) === -1 && c.indexOf(CW_norm(cfg.franchiseCanon)) === -1) return false;
+  }
+  return true;
+}
+
+function CW_franchiseSourceSignature(parsed, cfg) {
+  if (!cfg.franchise || cfg.franchiseSourceMode === "ignore" || !cfg.franchiseSourceCards) return "";
+  var cards = parsed.cards || [], parts = [], i;
+  for (i = 0; i < cards.length; i++) {
+    var c = cards[i] || {}, t = CW_norm(c.type || "");
+    if (t !== "canon source" && t !== "franchise source" && t !== "source canon") continue;
+    var src = CW_parseCanonSourceCard(c);
+    if (!CW_sourceCardMatches(src, cfg)) continue;
+    parts.push(String(c.id) + ":" + CW_hash(JSON.stringify(src.meta || {}) + "|" + src.body));
+  }
+  return parts.length ? CW_hash(parts.join("|")) : "";
 }
 
 function CW_franchiseSourceContext(parsed, cfg) {
   if (cfg.franchiseSourceMode === "ignore") return "";
   if (!cfg.franchiseSourceCards || cfg.franchiseSourceChars <= 0) return "";
-  var cards = parsed.cards || [];
-  var out = [], used = 0, i;
-
+  var cards = parsed.cards || [], out = [], used = 0, i;
   for (i = 0; i < cards.length; i++) {
-    var c = cards[i] || {};
-    var t = CW_norm(c.type || "");
+    var c = cards[i] || {}, t = CW_norm(c.type || "");
     if (t !== "canon source" && t !== "franchise source" && t !== "source canon") continue;
-    var entry = String(c.entry || "");
-    if (!entry) continue;
+    var src = CW_parseCanonSourceCard(c);
+    if (!CW_sourceCardMatches(src, cfg) || !src.body) continue;
+    var header = [];
+    if (src.meta.source_ref || src.meta.ref) header.push("Ref " + (src.meta.source_ref || src.meta.ref));
+    if (src.meta.range) header.push("Range " + src.meta.range);
+    var chunk = (header.length ? ("[" + header.join(" • ") + "]\n") : "") + src.body;
     var room = cfg.franchiseSourceChars - used;
     if (room <= 0) break;
-    if (entry.length > room) entry = entry.slice(0, room);
-    out.push(entry);
-    used += entry.length + 1;
+    if (chunk.length > room) chunk = chunk.slice(0, room);
+    out.push(chunk); used += chunk.length + 1;
   }
   return out.join("\n");
 }
 
 function CW_captureFranchisePlan(output, parsed, cfg) {
   output = String(output || "");
-  var startTag = "<CW_FRANCHISE_PLAN>";
-  var endTag = "</CW_FRANCHISE_PLAN>";
-  /* Use the final complete machine block if the model accidentally emits more
-     than one. Every control block is stripped from visible prose below. */
-  var start = output.lastIndexOf(startTag);
-  if (start < 0) {
+  var s0 = CW_state(), f0 = CW_ensureFranchiseState(s0);
+  var re = /<CW_FRANCHISE_PLAN(?:\s+nonce=["']?([^"'>\s]+)["']?)?>([\s\S]*?)<\/CW_FRANCHISE_PLAN>/gi;
+  var m, payload = "", nonce = "";
+  while ((m = re.exec(output))) { nonce = String(m[1] || ""); payload = String(m[2] || ""); }
+
+  var cleaned = output.replace(/<CW_FRANCHISE_PLAN(?:\s+nonce=["']?[^"'>\s]+["']?)?>[\s\S]*?<\/CW_FRANCHISE_PLAN>/gi, "");
+  var orphanRe = f0.planNonce ? new RegExp("<CW_FRANCHISE_PLAN\\s+nonce=[\"']?" + CW_escapeRegex(f0.planNonce), "i") : /<CW_FRANCHISE_PLAN>/i;
+  var om = orphanRe.exec(cleaned);
+  if (om) cleaned = cleaned.slice(0, om.index);
+  cleaned = cleaned.replace(/\s+$/g, "");
+
+  if (payload && cfg.franchisePlannerNonce && f0.planNonce && nonce !== f0.planNonce) {
+    CW_log("Ignored franchise planner block with wrong nonce.", true);
+    payload = "";
+  }
+
+  if (!payload) {
     var fMiss = CW_ensureFranchiseState(CW_state());
     if (cfg.franchise && fMiss.lastPlanTurn === CW_state().turn && fMiss.lastCapturedAction !== CW_state().turn && fMiss.lastMissedAction !== CW_state().turn) {
       fMiss.lastMissedAction = CW_state().turn;
       fMiss.failures += 1;
-      fMiss.lastReason = "planner-block-missing";
+      fMiss.lastReason = "planner-block-missing-or-invalid";
       if (fMiss.failures >= cfg.franchiseMaxFailures) {
         fMiss.status = "failed";
         CW_toast("Canon Weave franchise builder paused after repeated planner failures. Use /canon franchise rebuild after adjusting the config.");
       }
     }
-    return output;
-  }
-
-  var end = output.indexOf(endTag, start + startTag.length);
-  var cleaned;
-  var payload;
-
-  if (end < 0) {
-    /* Never expose a half-generated control block. The next normal action can
-       retry planning automatically. Strip from the orphan marker onward. */
-    cleaned = output.slice(0, start).replace(/\s+$/g, "");
-    var f0 = CW_ensureFranchiseState(CW_state());
-    f0.failures += 1;
-    f0.lastReason = "unterminated-plan-block";
     return cleaned;
   }
-
-  payload = output.slice(start + startTag.length, end).replace(/^\s+|\s+$/g, "");
-  cleaned = output.replace(/<CW_FRANCHISE_PLAN>[\s\S]*?<\/CW_FRANCHISE_PLAN>/g, "");
-  var orphan = cleaned.indexOf(startTag);
-  if (orphan >= 0) cleaned = cleaned.slice(0, orphan);
-  cleaned = cleaned.replace(/\s+$/g, "");
 
   if (!cfg.franchise) return cleaned;
 
@@ -2530,6 +2792,13 @@ function CW_captureFranchisePlan(output, parsed, cfg) {
     return cleaned;
   }
 
+  if (cfg.franchisePlannerNonce && f.planNonce) {
+    if (String(plan.protocol || "") !== "CW1" || String(plan.nonce || "") !== f.planNonce) {
+      f.failures += 1; f.lastReason = "planner-protocol-mismatch";
+      CW_log("Franchise planner protocol/nonce mismatch.", true);
+      return cleaned;
+    }
+  }
   var planStatus = CW_norm((plan && plan.status) || "ok");
   if (plan && planStatus !== "ok" && planStatus !== "uncertain" && planStatus !== "needs_continuity") {
     f.failures += 1;
@@ -2597,6 +2866,25 @@ function CW_similarLabel(a, b) {
   return denom > 0 && (hit / denom) >= 0.82;
 }
 
+function CW_generatedDelivery(kind, isAnchor, cfg) {
+  if (cfg.franchiseDeliveryPolicy && cfg.franchiseDeliveryPolicy !== "adaptive") return cfg.franchiseDeliveryPolicy;
+  if (cfg.franchisePlayerRole === "observer") return isAnchor ? "world" : "offscreen";
+  if (kind === "conditional" || kind === "minor") return "adaptive";
+  return isAnchor ? "world" : "adaptive";
+}
+function CW_generatedOutcome(kind, isAnchor, hard, cfg) {
+  if (cfg.franchiseOutcomePolicy && cfg.franchiseOutcomePolicy !== "adaptive") return cfg.franchiseOutcomePolicy;
+  if (cfg.franchiseDivergence === "reactive") return isAnchor && hard ? "flexible" : "opportunity";
+  if (cfg.franchiseDivergence === "strict") return isAnchor ? "fixed" : "flexible";
+  if (kind === "conditional" || kind === "minor") return "opportunity";
+  return isAnchor && hard ? "fixed" : "flexible";
+}
+function CW_generatedPresence(kind, isAnchor, cfg) {
+  if (cfg.franchisePlayerRole === "observer") return "none";
+  if (cfg.franchisePlayerRole === "original_character") return isAnchor ? "optional" : "none";
+  return isAnchor ? "optional" : "optional";
+}
+
 function CW_materializeFranchiseEvent(raw, cfg, f) {
   raw = raw || {};
   var confidence = CW_clamp(CW_num(raw.confidence, 0.75), 0, 1);
@@ -2630,6 +2918,12 @@ function CW_materializeFranchiseEvent(raw, cfg, f) {
   var blockers = CW_jsonStringArray(raw.blockers, 5);
   var protect = CW_jsonStringArray(raw.protect, 5);
   var forbid = CW_jsonStringArray(raw.forbid, 5);
+  var delivery = CW_deliveryMode(raw.delivery || "");
+  var outcome = CW_outcomePolicy(raw.outcome || "");
+  var presence = CW_playerPresence(raw.player_presence || raw.presence || "");
+  if (!delivery || delivery === "adaptive") delivery = CW_generatedDelivery(kind, isAnchor, cfg);
+  if (!outcome || outcome === "adaptive") outcome = CW_generatedOutcome(kind, isAnchor, hard, cfg);
+  if (!presence) presence = CW_generatedPresence(kind, isAnchor, cfg);
 
   if (cfg.franchiseRequireSourceRef && !sourceRef) return false;
   if (!body) body = "Canon beat: " + title + ". Preserve established continuity while allowing the current adventure to bridge naturally into this source-canon event.";
@@ -2646,6 +2940,9 @@ function CW_materializeFranchiseEvent(raw, cfg, f) {
   lines.push("generated_confidence: " + confidence.toFixed(2));
   lines.push("generated_kind: " + CW_metaSafe(kind || "major"));
   lines.push("generated_role: " + cfg.franchisePlayerRole);
+  lines.push("delivery: " + delivery);
+  lines.push("outcome: " + outcome);
+  lines.push("player_presence: " + presence);
   if (sourceRef) lines.push("source_ref: " + CW_metaSafe(sourceRef));
   lines.push("source_arc: " + arc);
   lines.push("order: " + String(f.eventIds.length + 1));
@@ -2780,6 +3077,7 @@ function CW_updateFranchiseRoadmapCard(cfg, f) {
   lines.push("Build: " + cfg.franchiseGranularity + " • " + cfg.franchiseDependencyStrategy + " dependencies • " + cfg.franchiseDivergence + " divergence • role " + cfg.franchisePlayerRole);
   if (f.cursor) lines.push("Cursor: " + f.cursor);
   if (f.lastBatchSummary) lines.push("Latest batch: " + f.lastBatchSummary);
+  if (f.sourceChanged) lines.push("⚠ Canon Source changed after roadmap generation. Rebuild recommended before further planning.");
   if (f.suggestions && f.suggestions.length) lines.push("Continuity options: " + f.suggestions.join(" / "));
   lines.push("");
   lines.push("GENERATED CANON");
@@ -2861,6 +3159,9 @@ function CW_validateGraph(events, cards, cfg) {
     if (e.afterBefore > 0 && e.afterDelay > e.afterBefore) errors.push(e.id + " has after_delay later than after_before");
     if ((e.afterDelay || e.afterBefore) && !e.after.length && !e.afterAny.length && !e.afterResolved.length) warnings.push(e.id + " uses a relative timeline without after:/after_any:/after_resolved:");
     if (e.mode === "force" && !e.fallback && !e.completeAny.length && !e.completeAll.length && !e.completeClauses.length && !e.completeRegex) warnings.push(e.id + " is force mode with neither completion evidence nor fallback");
+    if (e.completeAny.length && e.completeMin > e.completeAny.length) warnings.push(e.id + " complete_min exceeds number of complete: alternatives; it will clamp to the available alternatives");
+    if (e.whenAny.length && e.whenMin > e.whenAny.length) warnings.push(e.id + " when_min exceeds number of when: alternatives; it will clamp to the available alternatives");
+    if (e.outcomePolicy === "fixed" && e.playerPresence === "required" && cfg.preservePlayerAgency) warnings.push(e.id + " combines fixed outcome + required player presence; make sure the required outcome does not depend on an unchosen player decision");
     if (e.strictOrder && e.arc && e.order > 0) {
       var ao = e.arc + "#" + e.order;
       if (arcOrders[ao]) warnings.push("Arc " + e.arc + " has duplicate strict order " + e.order + " (" + arcOrders[ao] + ", " + e.id + ")");
@@ -3067,6 +3368,14 @@ function CW_applyCommand(cmd, parsed, cfg) {
       return;
     }
 
+    if (sub === "build") {
+      f.manualBuildRequested = true; f.paused = false;
+      if (cfg.franchise && f.generated < f.target) f.status = "building";
+      f.lastPlanTurn = -999999;
+      CW_toast(cfg.franchise ? "Franchise planner queued for the next eligible generation." : "Set franchise: NAME in Canon Config first.");
+      return;
+    }
+
     if (sub === "pause") {
       f.paused = true;
       f.status = "paused";
@@ -3089,6 +3398,7 @@ function CW_applyCommand(cmd, parsed, cfg) {
       f.lastCapturedAction = -999999; f.lastMissedAction = -999999; f.eventIds = []; f.titles = []; f.complete = false;
       f.cursor = ""; f.sourceRefs = []; f.suggestions = []; f.lastBatchSummary = "";
       f.anchorIds = []; f.lastAnchorId = ""; f.lastStableId = ""; f.lastSourceModeNotice = "";
+      f.planNonce = ""; f.sourceHash = CW_franchiseSourceSignature(parsed, cfg); f.sourceChanged = false; f.manualBuildRequested = false;
       f.roadmapKey = "%CW:ROADMAP:" + f.activeSet + "%";
       f.paused = false; f.status = cfg.franchise ? "building" : "disabled"; f.lastReason = "manual-rebuild";
       f.virtualCards = [];
@@ -3101,12 +3411,13 @@ function CW_applyCommand(cmd, parsed, cfg) {
       f.generated = 0; f.batches = 0; f.failures = 0; f.eventIds = []; f.titles = [];
       f.cursor = ""; f.sourceRefs = []; f.suggestions = []; f.lastBatchSummary = "";
       f.anchorIds = []; f.lastAnchorId = ""; f.lastStableId = ""; f.lastSourceModeNotice = "";
+      f.planNonce = ""; f.sourceChanged = false; f.manualBuildRequested = false;
       f.complete = false; f.paused = true; f.status = "paused"; f.virtualCards = [];
       CW_toast("Cleared " + removed + " generated franchise card(s) and paused rebuilding.");
       return;
     }
 
-    CW_toast("Usage: /canon franchise status|roadmap|pause|resume|rebuild|clear");
+    CW_toast("Usage: /canon franchise status|roadmap|build|pause|resume|rebuild|clear");
     return;
   }
 
@@ -3187,6 +3498,12 @@ function CW_blockedPolicy(v) {
   if (v === "skip" || v === "resolve" || v === "cancel") return "skip";
   if (v === "wait" || v === "hold") return "wait";
   return "";
+}
+
+function CW_mergeInto(target, src) {
+  target = target || {}; src = src || {};
+  var k; for (k in src) if (src.hasOwnProperty(k)) target[k] = src[k];
+  return target;
 }
 
 function CW_pick(obj, keys) {
