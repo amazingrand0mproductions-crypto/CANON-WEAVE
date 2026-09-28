@@ -33,7 +33,7 @@ It is designed for franchise adaptations, campaign arcs, episode structures, mys
 
 ---
 
-## 📥 Installation
+## 📥 Installation — now zero-config
 
 AI Dungeon provides **Library, Input, Context and Output** script tabs. Copy:
 
@@ -46,9 +46,44 @@ AI Dungeon provides **Library, Input, Context and Output** script tabs. Copy:
 
 The non-Library files already finish with `modifier(text)`.
 
-Import `CANON_CONFIG_Story_Cards.json` for the supplied config. Story Card import/export is a replacement operation in AI Dungeon, so export/merge your existing cards first if the scenario already contains Story Cards.
+### ✅ You do **not** need to import a Config JSON just to make the script work
 
-Official API reference: https://help.aidungeon.com/faq/how-do-i-write-scripts-and-use-scripting
+CANON WEAVE now contains an embedded first-run installer. If the script code is installed but no `Canon Config` Story Card exists, the first real Adventure hook automatically creates:
+
+- ⚙️ **CANON WEAVE — MASTER CONFIG**
+- 🛠️ **CANON WEAVE — ADVANCED CONFIG**
+
+The engine also works from embedded defaults if Story Card creation is unavailable, so a missing Config card can no longer make CANON WEAVE appear dead.
+
+### Important AI Dungeon editor limitation
+
+Adding a Script in **Scenario Creation** installs the JavaScript, but the JavaScript is not executing merely because it was added to the editor. CANON WEAVE therefore cannot pre-populate Scenario-level Story Cards at install time. The auto-created Config cards appear after the Scenario is actually played and a script hook runs.
+
+If you want the Config cards visible **inside Scenario Creation before publishing**, use the optional root file:
+
+`CANON_CONFIG_Story_Cards.json`
+
+AI Dungeon currently exposes Story Card import/export on the web editor, not the native mobile apps. Import replaces the current Story Card set, so export/merge existing cards first.
+
+### Built-in/community Script installation
+
+If you add CANON WEAVE through AI Dungeon's Script UI, the same rule applies: the Script code can be installed without any bundled Story Cards. Start an Adventure from the Scenario and CANON WEAVE will create its control cards on first run.
+
+If the cards were deleted later, run:
+
+```text
+/canon setup
+```
+
+To inspect installation state:
+
+```text
+/canon setup status
+```
+
+If absolutely nothing happens when an Adventure runs, check AI Dungeon **Account Settings → Gameplay → Scripts**. A globally disabled Scripts toggle prevents every script from running, so no script can self-repair around it.
+
+Official scripting reference: https://help.aidungeon.com/faq/how-do-i-write-scripts-and-use-scripting
 
 ---
 
@@ -248,6 +283,8 @@ This avoids “ghost canon” where a discarded output secretly leaves a charact
 /canon reset all
 /canon flag NAME=true
 /canon doctor
+/canon setup
+/canon setup status
 
 /canon franchise status
 /canon franchise roadmap
@@ -272,7 +309,7 @@ node tests/package_sanity.test.js
 node tests/performance_smoke.test.js
 ```
 
-The mock runtime covers normal scheduling, supporting cards, Retry/Undo rollback, relative timelines, placeholders, negation, clause completion, franchise generation, roadmap materialization, source-required mode, backbone dependencies, layered configs, N-of-M conditions, urgent preemption, structured source filtering, planner nonces and smart support extraction.
+The mock runtime covers normal scheduling, supporting cards, Retry/Undo rollback, relative timelines, placeholders, negation, clause completion, franchise generation, roadmap materialization, source-required mode, backbone dependencies, layered configs, N-of-M conditions, urgent preemption, structured source filtering, planner nonces, smart support extraction, **zero-config first-run installation, index-0 Story Card creation, Config-card repair, and defaults-only fallback when Story Card writes are unavailable**.
 
 The performance smoke test builds a large synthetic card/event library to catch accidental algorithmic regressions. It is not a substitute for AI Dungeon's own 2-second sandbox test, but it is useful for development.
 
@@ -302,6 +339,7 @@ CANON_WEAVE/
 ├── CARD_TEMPLATE.txt
 ├── Example_Story_Cards.json
 ├── QUICKSTART.md
+├── INSTALLATION.md
 ├── README.md
 ├── CHANGELOG.md
 ├── docs/

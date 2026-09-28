@@ -17,7 +17,7 @@
  * - every hook fails open instead of breaking the adventure
  */
 
-var CW_SCHEMA = 7;
+var CW_SCHEMA = 8;
 
 var CW_DEFAULTS = {
   enabled: true,
@@ -129,6 +129,35 @@ var CW_DEFAULTS = {
   debug: false
 };
 
+/* ========================================================================
+ * ZERO-CONFIG / FIRST-RUN INSTALLER
+ * ====================================================================== */
+
+/* AI Dungeon installs Scripts and Story Cards as separate scenario components.
+ * Therefore adding CANON WEAVE from the Script UI cannot create editor-level
+ * config cards until a scripting hook actually executes.  CANON WEAVE now
+ * solves that gap by creating its own config cards on the first Adventure hook.
+ *
+ * The engine never requires these cards to exist: embedded defaults remain the
+ * source of truth when Story Card writes are unavailable.  The cards are a UI
+ * control panel, not a hard runtime dependency.
+ */
+var CW_SETUP_VERSION = 1;
+var CW_SETUP_MASTER = {
+  keys: "%CW:CONFIG:MASTER%",
+  entry: "@CANON_CONFIG\nconfig_priority:10\npreset:balanced\nenabled:true\ndefault_mode:strong\ndefault_deadline_policy:catchup\npreserve_player_agency:true\npreserve_established_facts:true\nforeshadow:true\nforeshadow_lead:4\nmax_foreshadow_events:2\nfranchise:\nfranchise_canon:\nfranchise_scope:main canon\nfranchise_start:\nfranchise_end:\nfranchise_route:\nfranchise_filler:exclude\nfranchise_granularity:major\nfranchise_auto_generate:true\nfranchise_event_count:24\nfranchise_pacing:normal\nfranchise_event_policy:tiered\nfranchise_enforcement:strong\nfranchise_deadline_policy:force\nfranchise_source_mode:prefer\nfranchise_dependency_strategy:backbone\nfranchise_divergence:adaptive\nfranchise_player_role:original_character\nfranchise_build_mode:steady\nfranchise_delivery_policy:adaptive\nfranchise_outcome_policy:adaptive\nfranchise_materialize_cards:true\nfranchise_roadmap_card:true\ndashboard:false\n---",
+  type: "Canon Config",
+  title: "⚙️ CANON WEAVE — MASTER CONFIG",
+  notes: "⚙️ CANON WEAVE — MASTER CONFIG\n\nCANON WEAVE now supports layered Config Story Cards. Both supplied cards use Type `Canon Config`, so they stay together in the same Story Card category. The friendly Master card contains the controls most people actually change; the Advanced card contains precision, performance and planner tuning. The script merges every Canon Config card by `config_priority`, then lets higher-priority cards override lower-priority values.\n\nYou can therefore create your own tiny override card instead of editing the long defaults:\n\n@CANON_CONFIG\nconfig_priority:100\nfranchise:Naruto\npreset:cinematic\n---\n\nThe Notes below explain EVERY setting used by both supplied config cards. Settings you omit simply use the selected preset/default.\n\n━━━━━━━━━━━━━━━━━━\n🎚️ PRESETS & CONFIG LAYERS\n━━━━━━━━━━━━━━━━━━\n• config_priority — Merge order for multiple Canon Config cards. Higher numbers override lower numbers. The supplied Master uses 10 and Advanced uses 20. Use 100+ for a personal override card. This is a config-card control, not a runtime story option.\n\n• preset — Starting profile applied before individual settings. `balanced` is the normal recommendation. `strict` favors exact detection and source accuracy. `player_first` softens enforcement and favors divergence. `cinematic` increases foreshadowing and flexible presentation. `source_locked` requires source-grounded franchise generation and stricter canon. `minimal` disables most automatic extras. Any setting explicitly written in a Config card overrides the preset.\n\n• fair_scheduler — Prevents a continuously eligible lower-priority event from being starved forever by a stream of slightly higher-priority events.\n\n• starvation_turns — How long an eligible event waits before fairness boosting begins. Default 8.\n\n• starvation_boost — Scheduler score added once starvation protection starts. Default 1800, roughly enough to matter without automatically beating a genuinely critical event.\n\n• allow_preemption — Lets a truly urgent Force/overdue event interrupt a lower-pressure active event. The interrupted event is re-armed instead of discarded.\n\n• preempt_priority_gap — Minimum priority difference normally required for Force preemption when the incoming event is not already overdue. Default 25.\n\n━━━━━━━━━━━━━━━━━━\n🧠 SMART SUPPORT EXTRACTION\n━━━━━━━━━━━━━━━━━━\n• smart_card_extract — When an automatically retrieved Story Card is very long, extract the most relevant sentences instead of blindly cutting the first N characters. Explicit `include:` cards remain full/authoritative.\n\n• smart_card_sentences — Maximum relevant sentences kept from an oversized automatically selected card. Default 5.\n\n• smart_card_lead_chars — Small beginning fragment kept with the extracted sentences so identity/definition text at the start of a card is not lost. Default 260.\n\n━━━━━━━━━━━━━━━━━━\n🎬 FRANCHISE HARDENING\n━━━━━━━━━━━━━━━━━━\n• franchise_planner_nonce — Adds a one-use nonce to hidden Franchise Auto-Builder blocks. The Output hook only accepts the matching machine block, making accidental tag-like story text far less likely to be parsed as planner data. Recommended true.\n\n• franchise_source_filter_strict — Structured `@CANON_SOURCE` cards can name `franchise:` and `continuity:`. When true, source cards for another continuity are excluded instead of being blended into the active roadmap.\n\n• franchise_rebuild_on_source_change — If true, changing matching Canon Source content can rebuild the auto-generated roadmap. Default false for safety: once a roadmap exists, changed source pauses the builder and asks you to rebuild manually rather than deleting live generated canon unexpectedly.\n\n• franchise_build_mode — `steady` builds at the configured interval; `frontload` tries every eligible generation until the roadmap is ready; `manual` builds only after `/canon franchise build`.\n\n• franchise_delivery_policy — Default presentation of generated franchise events. `adaptive` chooses per beat; `scene` prefers the current scene; `world` lets the event advance as a world event; `offscreen` allows canon to happen away from the player and arrive through consequences.\n\n• franchise_outcome_policy — Default generated-event outcome philosophy. `adaptive` chooses by importance/divergence policy; `fixed` protects the world-side source outcome; `flexible` preserves the beat/function but allows consequences to change; `opportunity` guarantees the canon pressure/opportunity while leaving the actual choice/outcome open.\n\n━━━━━━━━━━━━━━━━━━\n🧠 DETECTION & EVIDENCE\n━━━━━━━━━━━━━━━━━━\n• enabled — Master switch. `true` runs CANON WEAVE. `false` leaves the story untouched while preserving saved state.\n\n• scene_actions — Number of recent adventure actions treated as the current scene for `when:` / `scene_unless:` matching. Default `10`. Lower = more local and precise; higher = better for slow scenes. Recommended 6–14.\n\n• evidence_turns — How long ordinary remembered evidence is retained for `require:` checks. Default `120`. Permanent canon completion and permanent blocker state are tracked separately.\n\n• max_evidence_keys — Safety cap for remembered evidence phrases. Default `650`. Raise only for very large scenarios with many distinct Canon Event conditions.\n\n• default_match — Default matching mode for normal scene/evidence detection. `strict`, `balanced`, or `loose`. `balanced` is recommended.\n\n• completion_match — Default mode used to decide whether an event really finished. `strict` is recommended because false completion is worse than a delayed completion.\n\n• blocker_match — Default mode for permanent contradictions such as `unless:`. Keep `strict` unless you deliberately want broad blockers.\n\n• fuzzy_threshold — Token coverage needed by non-strict matching. Default `0.72`. Higher is more precise; lower is more tolerant. Balanced mode also applies its own conservative floor.\n\n• negation_aware — When `true`, common nearby negations are considered. Example: “the villain is not dead” should not satisfy `complete: villain dead`.\n\n• negation_window — Character window inspected before a matched phrase/token for negation. Default `42`. Increase cautiously; too large can make unrelated “not” words interfere.\n\n━━━━━━━━━━━━━━━━━━\n🗓️ TIMELINE & ENFORCEMENT\n━━━━━━━━━━━━━━━━━━\n• global_cooldown — Minimum completed-action gap between separate canon events. `0` disables the global delay.\n\n• allow_catch_up — Legacy/default behavior for events whose intended window has passed. `true` allows late beats unless an event explicitly uses another deadline policy.\n\n• default_deadline_policy — Default when an event passes `before:`. `catchup` keeps waiting for normal conditions, `skip` marks it missed, `force` can eventually waive scene-location cues and bridge the beat in.\n\n• force_deadline_grace — Extra actions after `before:` before a `force` deadline is allowed to ignore current-scene `when:` cues. Default `2`. This prevents an event becoming abruptly location-agnostic the instant it is one action late.\n\n• default_mode — Default enforcement mode. `soft` = one nudge; `strong` = retry cycles; `force` = strongest enforcement and optional fallback.\n\n• default_retries — Attempts in one strong/force burst before backoff/fallback logic. Default `4`.\n\n• strong_cycles — Number of strong-mode retry bursts before the event is marked missed. Default `3`.\n\n• retry_delay — Actions to wait before a failed strong event re-arms for another cycle. Default `2`.\n\n• force_max_attempts — Safety ceiling for force events with no successful completion/fallback. Prevents permanent loops. Default `10`.\n\n━━━━━━━━━━━━━━━━━━\n📚 CONTEXT & STORY CARD RETRIEVAL\n━━━━━━━━━━━━━━━━━━\n• max_include_cards — Absolute maximum supporting Story Cards injected beside one active Canon Event. Default `8`.\n\n• auto_include — Global switch for automatic supporting-card retrieval. Explicit `include:` references still work when this is false.\n\n• auto_include_cards — Maximum automatically selected Story Cards per active event. Default `3`.\n\n• auto_include_min_score — Relevance score required before an ordinary Story Card can be auto-selected. Higher reduces weak matches. Default `5`.\n\n• auto_include_diversity — If true, the first auto-selection pass prefers different Story Card types instead of returning three near-identical Character cards.\n\n• auto_include_type_cap — Maximum automatically selected cards of the same Type. Default `2`. Explicit `include:` references are not blocked by this cap.\n\n• auto_include_dedupe — Removes automatic support cards whose Entry text is effectively duplicated by another selected card. Useful when a large Story Card library contains aliases/copies.\n\n• max_inject_chars — Hard ceiling for the entire CANON WEAVE context block. Default `7600` characters. This is a ceiling, not a target.\n\n• adaptive_context_budget — Recommended `true`. CANON WEAVE scales its injection down using the current model's `info.maxChars`, instead of always consuming the hard ceiling.\n\n• max_context_share — Maximum share of the model context CANON WEAVE may try to occupy when adaptive budgeting is enabled. Default `0.20` (20%).\n\n• min_history_chars — History/context reserve used by adaptive budgeting. Default `5200`. The engine avoids growing its own block so large that too much useful adventure history has to be displaced.\n\n• max_card_chars — Per-support-card Entry cap. Default `1800`. Very long lore cards are trimmed before injection.\n\n• preserve_player_agency — Adds an explicit rule that canon may pressure the world/NPC side but must not choose the player's unattempted actions, dialogue, thoughts, loyalties, feelings or decisions.\n\n• preserve_established_facts — Tells the model to bridge toward canon instead of erasing legitimate story consequences just to imitate source material.\n\n━━━━━━━━━━━━━━━━━━\n🌒 FORESHADOWING\n━━━━━━━━━━━━━━━━━━\n• foreshadow — Master switch for future-event seeds when no canon event or franchise-planning task currently owns the context slot.\n\n• foreshadow_lead — Default number of actions before an event's `at:` time where seeding may begin. Default `4`.\n\n• max_foreshadow_events — Maximum future events seeded at once. Default `2`. Keep low so setup stays subtle.\n\n━━━━━━━━━━━━━━━━━━\n🎬 FRANCHISE — IDENTITY & RANGE\n━━━━━━━━━━━━━━━━━━\n• franchise — Franchise/property name. Blank disables automatic roadmap generation. Example `Naruto`, `Buffy the Vampire Slayer`, `Mass Effect`.\n\n• franchise_canon — Exact continuity/adaptation. Very important for reboots, remakes, film vs TV, game routes, manga vs anime, etc.\n\n• franchise_scope — Free-form instruction describing what kind of canon matters, e.g. `main canon and major character arcs` or `main quest only`.\n\n• franchise_start — Source boundary where generation should begin, e.g. `Season 2`, `Chunin Exams`, `Mass Effect 2 opening`.\n\n• franchise_end — Source boundary where generation should stop, e.g. `Season 5 finale` or `end of original game`.\n\n• franchise_route — Optional route/focus, e.g. `Paragon main route`, `Buffy-focused canon`, `main story, skip side quests`.\n\n• franchise_filler — `exclude`, `include`, or `only`. Default `exclude`. For anime, `exclude` tells the planner not to turn filler-only material into backbone canon.\n\n• franchise_granularity — `anchors`, `major`, or `detailed`. `anchors` keeps only plot backbone; `major` is recommended; `detailed` adds more intermediate beats.\n\n━━━━━━━━━━━━━━━━━━\n🏗️ FRANCHISE — GENERATION PIPELINE\n━━━━━━━━━━━━━━━━━━\n• franchise_auto_generate — Master Franchise Auto-Builder switch once `franchise:` is set.\n\n• franchise_event_count — Target number of generated Canon Events, 1–80. It is a target, not permission to invent filler. The planner may finish early if the selected source range has fewer worthwhile events.\n\n• franchise_batch_size — Events requested per hidden planning batch. Default `5`. Smaller batches are slower but usually easier for the model to keep chronological and valid.\n\n• franchise_build_every — Minimum action gap between hidden planning batches. Default `2`. Roadmap generation pauses automatically while a real Canon Event is active.\n\n• franchise_max_failures — Consecutive planner failures allowed before automatic generation pauses. Default `5`.\n\n• franchise_pacing — `compressed`, `normal`, or `slow`. Controls generated relative windows between beats; it does not alter prose length.\n\n• franchise_first_event_at — Earliest action for the first generated event. Default `4`, giving the adventure room to establish itself.\n\n• franchise_planner_max_chars — Hard cap for the hidden roadmap-planner instruction, including source material. Default `6800`. Keeps planning from dominating context.\n\n• franchise_planner_history — Number of recent generated event titles repeated to the planner as anti-duplication history. Default `18`.\n\n━━━━━━━━━━━━━━━━━━\n🪜 FRANCHISE — EVENT STRENGTH & STRUCTURE\n━━━━━━━━━━━━━━━━━━\n• franchise_event_policy — `tiered` or `uniform`. `tiered` is recommended: anchors stay firm, minor/conditional beats stay flexible. `uniform` applies one enforcement policy to everything.\n\n• franchise_anchor_threshold — Importance 1–5 at which a generated event is treated as a backbone anchor under tiered mode. Default `4`.\n\n• franchise_enforcement — Enforcement mode inherited by generated anchor/hard-canon events: `soft`, `strong`, or `force`. Default `strong`.\n\n• franchise_deadline_policy — Deadline behavior inherited by important generated events: `catchup`, `skip`, or `force`. Default `force`.\n\n• franchise_dependency_strategy — `backbone` or `linear`. **Backbone is recommended.** `backbone` prevents optional/minor generated events becoming hard gates for every later canon beat. Later anchors link to the previous anchor. `linear` chains every generated event to the one before it.\n\n• franchise_divergence — `strict`, `adaptive`, or `reactive`.\n  - `strict`: preserve the source backbone whenever logically possible; contradicted anchors wait rather than auto-skip.\n  - `adaptive`: recommended. Preserve backbone outcomes but allow genuinely contradicted generated beats to resolve as skipped so later anchors can adapt instead of deadlocking.\n  - `reactive`: player-created consequences take highest priority; non-anchor generated beats stay especially flexible.\n\n• franchise_player_role — How the player relates to the source protagonist:\n  - `original_character` (default): player is their own character; canon cast/world can carry source beats.\n  - `canon_protagonist`: player occupies the source protagonist role, but agency is still protected.\n  - `replacement`: player replaces the source protagonist's plot function.\n  - `observer`: canon can progress around the player without requiring them to perform protagonist actions.\n\n━━━━━━━━━━━━━━━━━━\n📖 FRANCHISE — SOURCE ACCURACY\n━━━━━━━━━━━━━━━━━━\n• franchise_source_cards — Enables reading Story Cards whose Type is `Canon Source`, `Franchise Source`, or `Source Canon` and passing their Entry to the hidden planner.\n\n• franchise_source_chars — Maximum source-card characters supplied to one planner batch. Default `3200`.\n\n• franchise_source_mode — `ignore`, `prefer`, or `require`.\n  - `ignore`: do not use Canon Source cards.\n  - `prefer`: default; use them when present, otherwise fall back to model knowledge.\n  - `require`: do not build a roadmap until at least one Canon Source card exists. Best for obscure franchises, recent canon, exact episode/chapter accuracy, or creator-controlled timelines.\n\n• franchise_confidence_floor — Reject planner events below this confidence value (0–1). Default `0.60`. Raising it trades coverage for caution.\n\n• franchise_require_source_ref — If true, every generated event must provide a source position such as episode/chapter/mission/arc. Very strict; can reject correct events when the model remembers the event but not its exact number.\n\n━━━━━━━━━━━━━━━━━━\n🧩 FRANCHISE — GENERATED CARD BEHAVIOR\n━━━━━━━━━━━━━━━━━━\n• franchise_auto_include — Lets generated Canon Events automatically retrieve relevant ordinary Story Cards.\n\n• franchise_materialize_cards — Recommended `true`. Generated roadmap events become real editable Canon Event Story Cards using AI Dungeon's `addStoryCard()` API. If false, CANON WEAVE keeps temporary virtual events in state instead.\n\n• franchise_cleanup_old — When the franchise/continuity identity changes or you rebuild, remove CANON WEAVE's old auto-generated franchise cards so different continuities do not mix.\n\n• franchise_generated_protect — Lets generated events carry `protect:` and `forbid:` continuity safeguards suggested by the planner.\n\n• franchise_generated_blockers — Lets generated events carry specific `unless:` contradiction signals. In adaptive/reactive divergence mode, those generated blockers can resolve an impossible beat instead of freezing the later backbone.\n\n• franchise_roadmap_card — Creates/updates a creator-facing `Canon Roadmap` Story Card showing build status, cursor and generated event titles.\n\n• franchise_roadmap_max_chars — Maximum Entry size of the Roadmap display card. Default `1900`.\n\n━━━━━━━━━━━━━━━━━━\n🩺 VALIDATION, DASHBOARD & LOGGING\n━━━━━━━━━━━━━━━━━━\n• validate_graph — Runs Canon Doctor validation when the event graph changes. Recommended `true`.\n\n• dashboard — Enables an optional live `Canon Dashboard` Story Card if one exists. Intended for creator testing, not normal lore retrieval.\n\n• dashboard_every — Minimum actions between dashboard refreshes. Default `3`.\n\n• debug — Prints detailed engine logs to AI Dungeon's creator Script Test/console. Keep false for normal play; enable while diagnosing a scenario.\n\n━━━━━━━━━━━━━━━━━━\n🎚️ RECOMMENDED PRESETS\n━━━━━━━━━━━━━━━━━━\n\nBALANCED / DEFAULT\nfranchise_event_policy:tiered\nfranchise_dependency_strategy:backbone\nfranchise_divergence:adaptive\nfranchise_enforcement:strong\nfranchise_deadline_policy:force\nfranchise_source_mode:prefer\nadaptive_context_budget:true\n\nSTRICT ADAPTATION\nfranchise_dependency_strategy:backbone\nfranchise_divergence:strict\nfranchise_enforcement:force\nfranchise_deadline_policy:force\nfranchise_confidence_floor:0.75\nfranchise_source_mode:require\nfranchise_require_source_ref:true\n\nPLAYER-FIRST ADAPTATION\nfranchise_dependency_strategy:backbone\nfranchise_divergence:reactive\nfranchise_enforcement:strong\nfranchise_deadline_policy:catchup\npreserve_player_agency:true\npreserve_established_facts:true\n\n━━━━━━━━━━━━━━━━━━\n🧵 IMPORTANT EVENT-CARD TOOLS\n━━━━━━━━━━━━━━━━━━\nThe options above configure the engine globally. Individual `Canon Event` cards can override behavior with metadata such as:\n\n`at`, `before`, `relative_window`, `after`, `after_any`, `after_resolved`, `after_not`, `deadline_policy`, `deadline_grace`, `blocked_policy`, `when`, `when_all`, `when_clauses`, `require`, `require_any`, `require_clauses`, `unless`, `scene_unless`, `flags`, `not_flags`, `set`, `clear`, `group`, `cancel`, `include`, `exclude`, `include_types`, `exclude_types`, `mode`, `retries`, `max_cycles`, `complete`, `complete_all`, `complete_clauses`, `complete_unless`, `progress`, `fallback`, `protect`, `forbid`, `lead`, `seed`, and `bridge`.\n\n`after_resolved:` means the dependency may be completed, missed, or cancelled. It is useful for adaptive canon where one impossible beat should not deadlock the entire later timeline.\n\n`blocked_policy:skip` marks an event missed when its permanent `unless:` contradiction is established. `blocked_policy:wait` keeps it blocked indefinitely until the contradiction is manually resolved/reset.\n\n`strict_order_resolved:true` lets a strict arc advance past prior events that were legitimately skipped/cancelled, not only completed ones.\n\n━━━━━━━━━━━━━━━━━━\n🧰 CREATOR COMMANDS\n━━━━━━━━━━━━━━━━━━\n/canon status\n/canon next\n/canon why EVENT_ID\n/canon fire EVENT_ID\n/canon complete EVENT_ID\n/canon skip EVENT_ID\n/canon reset EVENT_ID\n/canon reset all\n/canon flag NAME=true\n/canon flag NAME=false\n/canon doctor\n/canon franchise status\n/canon franchise roadmap\n/canon franchise pause\n/canon franchise resume\n/canon franchise rebuild\n/canon franchise clear\n\n━━━━━━━━━━━━━━━━━━\n⚠️ FRANCHISE ACCURACY NOTE\n━━━━━━━━━━━━━━━━━━\nThe JavaScript cannot browse a wiki or make a separate model call by itself. Franchise Auto-Builder uses the same AI generation pass that writes the story, captures a hidden structured roadmap block, validates it, then removes the block before it reaches the player.\n\nFor well-known canon, `franchise_source_mode:prefer` can be convenient. For obscure, very recent, disputed, branch-heavy or episode-exact canon, use creator-written Canon Source cards and `franchise_source_mode:require`. That is the most reliable mode because the planner is then grounded in source text you supplied rather than memory alone.\n\n\n━━━━━━━━━━━━━━━━━━\n🧩 EVENT-LEVEL CONTROLS ADDED\n━━━━━━━━━━━━━━━━━━\nThese are written on Canon Event cards rather than Config cards:\n\n• `when_min:N` — require N distinct `when:` alternatives in the current scene.\n• `complete_min:N` — require N distinct `complete:` alternatives; with `complete_within`, evidence can accumulate across nearby actions.\n• `delivery:adaptive|scene|world|offscreen` — controls whether the event must be shown locally or may progress as a world/offscreen beat.\n• `outcome:fixed|flexible|opportunity|adaptive` — separates preserving a canon situation from forcing a specific outcome.\n• `player_presence:required|optional|none` — says whether the player needs to be physically present, without ever authorizing the script to puppet the player's choices.\n\nFor franchise scenarios, these fields are generated automatically per event unless you override the franchise delivery/outcome policies.\n"
+};
+var CW_SETUP_ADVANCED = {
+  keys: "%CW:CONFIG:ADVANCED%",
+  entry: "@CANON_CONFIG\nconfig_priority:20\nscene_actions:10\nevidence_turns:120\nmax_evidence_keys:650\ndefault_match:balanced\ncompletion_match:strict\nblocker_match:strict\nfuzzy_threshold:0.72\nnegation_aware:true\nnegation_window:42\nfair_scheduler:true\nstarvation_turns:8\nstarvation_boost:1800\nallow_preemption:true\npreempt_priority_gap:25\nglobal_cooldown:0\nallow_catch_up:true\nforce_deadline_grace:2\ndefault_retries:4\nstrong_cycles:3\nretry_delay:2\nforce_max_attempts:10\nmax_include_cards:8\nauto_include:true\nauto_include_cards:3\nauto_include_min_score:5\nauto_include_diversity:true\nauto_include_type_cap:2\nauto_include_dedupe:true\nsmart_card_extract:true\nsmart_card_sentences:5\nsmart_card_lead_chars:260\nmax_inject_chars:7600\nadaptive_context_budget:true\nmax_context_share:0.20\nmin_history_chars:5200\nmax_card_chars:1800\nfranchise_batch_size:5\nfranchise_build_every:2\nfranchise_max_failures:5\nfranchise_first_event_at:4\nfranchise_anchor_threshold:4\nfranchise_auto_include:true\nfranchise_confidence_floor:0.60\nfranchise_require_source_ref:false\nfranchise_cleanup_old:true\nfranchise_source_cards:true\nfranchise_source_chars:3200\nfranchise_roadmap_max_chars:1900\nfranchise_planner_history:18\nfranchise_generated_protect:true\nfranchise_generated_blockers:true\nfranchise_planner_max_chars:6800\nfranchise_planner_nonce:true\nfranchise_source_filter_strict:true\nfranchise_rebuild_on_source_change:false\nvalidate_graph:true\ndashboard_every:3\ndebug:false\n---",
+  type: "Canon Config",
+  title: "🛠️ CANON WEAVE — ADVANCED CONFIG",
+  notes: "🛠️ CANON WEAVE — ADVANCED CONFIG\n\nThis card contains precision, scheduler, context-budget and Franchise Auto-Builder tuning. It is intentionally the same Type (`Canon Config`) as the Master card. CANON WEAVE merges both automatically using `config_priority`.\n\nThe Master Config Notes contain the complete explanation of every option in both cards. Most users should leave this card alone unless they are tuning detection, context use, planner accuracy or large Story Card libraries.\n\nTip: instead of editing this card, create a third Canon Config card with `config_priority:100` and only the values you want to override."
+};
+
 /* Common words removed from fuzzy token coverage. Keeping this conservative
  * makes names, places and concrete nouns carry more weight than grammar. */
 var CW_STOPWORDS = {
@@ -155,10 +184,16 @@ function CanonWeave(hook, text) {
 
   try {
     var s = CW_state();
+    CW_migrateState(s);
+
+    /* Self-install the friendly config control panel when a user installed only
+       the script code.  This occurs before parsing so the newly-created cards
+       are immediately available to the same hook. */
+    CW_bootstrapConfigCards(false);
+
     var parsed = CW_parseAllCards();
     var cfg = CW_buildConfig(parsed.config);
 
-    CW_migrateState(s);
     CW_applyFranchiseConfig(parsed, cfg);
     CW_filterGeneratedEvents(parsed, cfg);
     CW_pruneState(cfg);
@@ -378,6 +413,17 @@ function CW_state() {
       dashboardTurn: -999999,
       lastToast: "",
 
+      /* Schema 8: zero-config installer / self-healing config UI. */
+      setup: {
+        version: 0,
+        status: "idle",
+        attempts: 0,
+        complete: false,
+        added: 0,
+        lastError: "",
+        noticeShown: false
+      },
+
       /* Schema 3: action-aware history for undo/retry safety. */
       journal: [],
       baseline: null,
@@ -390,6 +436,7 @@ function CW_state() {
       /* Schema 6: resolved dependencies, adaptive budgets, stronger retry/franchise hardening. */
       /* Schema 7: merged configs, presets, fair scheduling, preemption, smart lore extraction,
          stronger franchise source grounding and nonce-verified planner protocol. */
+      /* Schema 8: zero-config self-installer and repairable config Story Cards. */
       franchise: {
         identity: "",
         name: "",
@@ -497,6 +544,11 @@ function CW_migrateState(s) {
     s.franchise = s.franchise || {};
     s.schema = 7;
   }
+  if (s.schema < 8) {
+    s.setup = s.setup || {};
+    s.schema = 8;
+  }
+  CW_ensureSetupState(s);
   CW_ensureFranchiseState(s);
 }
 
@@ -772,6 +824,189 @@ function CW_seenTurn(rec) {
     if (last && typeof last.turn === "number") return last.turn;
   }
   return rec && typeof rec.turn === "number" ? rec.turn : 0;
+}
+
+/* ========================================================================
+ * FIRST-RUN / ZERO-CONFIG INSTALLER
+ * ====================================================================== */
+
+function CW_ensureSetupState(s) {
+  s = s || CW_state();
+  s.setup = s.setup || {};
+  if (typeof s.setup.version !== "number") s.setup.version = 0;
+  if (!s.setup.status) s.setup.status = "idle";
+  if (typeof s.setup.attempts !== "number") s.setup.attempts = 0;
+  if (typeof s.setup.complete !== "boolean") s.setup.complete = false;
+  if (typeof s.setup.added !== "number") s.setup.added = 0;
+  if (typeof s.setup.lastError !== "string") s.setup.lastError = "";
+  if (typeof s.setup.noticeShown !== "boolean") s.setup.noticeShown = false;
+  return s.setup;
+}
+
+function CW_findStoryCardByExactKeys(keys) {
+  var cards = (typeof storyCards !== "undefined" && storyCards) ? storyCards : [];
+  var wanted = CW_norm(String(keys || ""));
+  var i;
+  for (i = 0; i < cards.length; i++) {
+    if (CW_norm(String((cards[i] || {}).keys || "")) === wanted) return cards[i];
+  }
+  return null;
+}
+
+function CW_scanSetupCards() {
+  var cards = (typeof storyCards !== "undefined" && storyCards) ? storyCards : [];
+  var master = CW_findStoryCardByExactKeys(CW_SETUP_MASTER.keys);
+  var advanced = CW_findStoryCardByExactKeys(CW_SETUP_ADVANCED.keys);
+  var custom = false, total = 0, i;
+
+  for (i = 0; i < cards.length; i++) {
+    var c = cards[i] || {};
+    var type = CW_norm(c.type || "");
+    var marker = CW_firstMarker(c.entry || "");
+    if (type === "canon config" || type === "canon weave config" || marker === "@canon_config") {
+      total += 1;
+      if (c !== master && c !== advanced) custom = true;
+    }
+  }
+
+  return { master:master, advanced:advanced, custom:custom, total:total };
+}
+
+function CW_decorateCreatedSetupCard(card, def) {
+  if (!card || !def) return;
+  /* Modern AI Dungeon Story Card objects expose title/description.  Older
+     runtimes safely ignore these extra properties; keys/entry/type still make
+     the card fully functional. */
+  try { card.title = def.title; } catch (ignore1) {}
+  try { card.description = def.notes; } catch (ignore2) {}
+  try { card.useForCharacterCreation = false; } catch (ignore3) {}
+}
+
+function CW_addSetupCard(def) {
+  if (!def) return null;
+  var existing = CW_findStoryCardByExactKeys(def.keys);
+  if (existing) return existing;
+  if (typeof addStoryCard !== "function") return null;
+
+  var result = false;
+  try {
+    /* Newer runtimes accept optional name/notes arguments.  Extra arguments are
+       harmless in the documented three-argument implementation. */
+    result = addStoryCard(def.keys, def.entry, def.type, def.title, def.notes);
+  } catch (errRich) {
+    try { result = addStoryCard(def.keys, def.entry, def.type); }
+    catch (errBasic) { throw errBasic; }
+  }
+
+  /* Never use `if (!result)`: index 0 is a valid successful return value. */
+  var card = CW_findStoryCardByExactKeys(def.keys);
+  if (!card && result !== false && typeof result === "number" && typeof storyCards !== "undefined") {
+    card = storyCards[result] || null;
+  }
+  if (!card && typeof storyCards !== "undefined" && storyCards.length) {
+    var tail = storyCards[storyCards.length - 1];
+    if (tail && CW_norm(tail.keys || "") === CW_norm(def.keys)) card = tail;
+  }
+
+  if (card) CW_decorateCreatedSetupCard(card, def);
+  return card;
+}
+
+function CW_bootstrapConfigCards(force) {
+  var s = CW_state();
+  var setup = CW_ensureSetupState(s);
+
+  /* After successful installation we do zero Story Card scanning on normal
+     turns.  /canon setup is the explicit repair path if the cards are later
+     deleted. This keeps the installer effectively free in large databases. */
+  if (!force && setup.complete && setup.version === CW_SETUP_VERSION) return setup;
+
+  var scan = CW_scanSetupCards();
+
+  /* A creator who supplied their own Canon Config card has deliberately
+     configured the engine. Do not clutter their database with our defaults. */
+  if (scan.custom && !scan.master && !scan.advanced) {
+    setup.complete = true;
+    setup.version = CW_SETUP_VERSION;
+    setup.status = "custom-config";
+    setup.lastError = "";
+    return setup;
+  }
+
+  if (scan.master && scan.advanced) {
+    setup.complete = true;
+    setup.version = CW_SETUP_VERSION;
+    setup.status = "ready";
+    setup.lastError = "";
+    return setup;
+  }
+
+  if (!force && setup.complete) return setup;
+  if (!force && setup.attempts >= 3) return setup;
+
+  setup.attempts += 1;
+  setup.status = "installing";
+  setup.lastError = "";
+
+  if (typeof addStoryCard !== "function") {
+    setup.status = "defaults-only";
+    setup.lastError = "addStoryCard is unavailable in this hook/runtime";
+    if (!setup.noticeShown) {
+      setup.noticeShown = true;
+      CW_toast("Canon Weave is running with embedded defaults. Config Story Cards could not be created in this runtime; use /canon setup to retry later.");
+    }
+    return setup;
+  }
+
+  try {
+    var added = 0;
+    if (!scan.master) { if (CW_addSetupCard(CW_SETUP_MASTER)) added += 1; }
+    if (!scan.advanced) { if (CW_addSetupCard(CW_SETUP_ADVANCED)) added += 1; }
+    setup.added += added;
+
+    scan = CW_scanSetupCards();
+    if ((scan.master && scan.advanced) || (scan.custom && !scan.master && !scan.advanced)) {
+      setup.complete = true;
+      setup.version = CW_SETUP_VERSION;
+      setup.status = scan.custom && !scan.master ? "custom-config" : "ready";
+      setup.lastError = "";
+      if (added > 0 && !setup.noticeShown) {
+        setup.noticeShown = true;
+        CW_toast("Canon Weave setup complete: Config Story Cards created automatically. Edit them in Story Cards whenever you want.");
+      }
+    } else {
+      setup.status = "defaults-only";
+      setup.lastError = "Story Card write did not persist";
+      if (!setup.noticeShown) {
+        setup.noticeShown = true;
+        CW_toast("Canon Weave is active with embedded defaults, but its Config Story Cards could not be saved. Use /canon setup to retry.");
+      }
+    }
+  } catch (err) {
+    setup.status = "defaults-only";
+    setup.lastError = CW_errorText(err);
+    CW_log("Config bootstrap failed: " + setup.lastError, true);
+    if (!setup.noticeShown) {
+      setup.noticeShown = true;
+      CW_toast("Canon Weave is active with embedded defaults. Automatic Config Story Card creation failed; /canon setup can retry.");
+    }
+  }
+
+  return setup;
+}
+
+function CW_setupStatusText() {
+  var s = CW_state();
+  var setup = CW_ensureSetupState(s);
+  var scan = CW_scanSetupCards();
+  var parts = [
+    "Canon Weave setup: " + setup.status,
+    "Master Config: " + (scan.master ? "present" : "missing"),
+    "Advanced Config: " + (scan.advanced ? "present" : "missing"),
+    "Custom Config: " + (scan.custom ? "present" : "none")
+  ];
+  if (setup.lastError) parts.push("Last issue: " + setup.lastError);
+  return parts.join(" | ");
 }
 
 /* ========================================================================
@@ -3353,6 +3588,21 @@ function CW_applyCommand(cmd, parsed, cfg) {
     return;
   }
 
+  if (cmd.action === "setup" || cmd.action === "install") {
+    var setupSub = CW_norm(cmd.args.shift() || "repair");
+    if (setupSub === "status") {
+      CW_toast(CW_setupStatusText());
+      return;
+    }
+    var setupState = CW_ensureSetupState(s);
+    setupState.complete = false;
+    setupState.attempts = 0;
+    setupState.noticeShown = false;
+    CW_bootstrapConfigCards(true);
+    CW_toast(CW_setupStatusText());
+    return;
+  }
+
   if (cmd.action === "franchise") {
     var sub = CW_norm(cmd.args.shift() || "status");
     var f = CW_ensureFranchiseState(s);
@@ -3446,6 +3696,7 @@ function CW_applyCommand(cmd, parsed, cfg) {
   }
 
   var status = "Canon action " + s.turn + " | active: " + (s.activeId || "none") + " | complete: " + CW_objectCount(s.completed) + " | flags: " + CW_trueKeys(s.flags).join(", ");
+  if (CW_ensureSetupState(s).status !== "ready" && CW_ensureSetupState(s).status !== "custom-config") status += " | setup " + CW_ensureSetupState(s).status;
   if (cfg.franchise) status += " | franchise " + CW_ensureFranchiseState(s).generated + "/" + CW_ensureFranchiseState(s).target;
   CW_toast(status);
 }
