@@ -33,6 +33,40 @@ It is designed for franchise adaptations, campaign arcs, episode structures, mys
 
 ---
 
+## 🛡️ Story Card Notes / Title safety
+
+**CANON WEAVE no longer writes Story Card Notes or Title at runtime.**
+
+AI Dungeon's documented scripting `storyCards` objects expose only `id`, `keys`, `entry`, and `type`. The documented Story Card mutations are `addStoryCard(keys, entry, type)`, `updateStoryCard(index, keys, entry, type)`, and `removeStoryCard(index)`.
+
+An earlier first-run installer tried to decorate runtime cards by assigning `card.title`, `card.description` (Notes), and `useForCharacterCreation`, and also passed extra undocumented arguments to `addStoryCard()`. That unsupported behavior has been removed.
+
+CANON WEAVE now routes **every runtime Story Card write through a Story Card Write Firewall**. It can only touch supported fields (`keys`, `entry`, `type`). This applies to:
+
+- first-run Config creation
+- generated Franchise Canon Events
+- Franchise Roadmap updates
+- Dashboard updates
+- generated-card cleanup
+
+Your Notes, Titles, and Character Creator metadata are therefore **user-owned** and left alone by CANON WEAVE.
+
+### Why runtime-created Config cards may have blank Notes
+
+The scripting API does not document a Notes/Title writer. So the self-installer deliberately creates safe working Config cards using only `keys`, `entry`, and `type`. A short help footer is included in Entry instead.
+
+If you want the fully titled Config cards with the complete option guide already in Notes, import the supplied `CANON_CONFIG_Story_Cards.json` through AI Dungeon's normal web Story Card importer. Those imported Notes remain editable because CANON WEAVE does not rewrite them.
+
+Creator check:
+
+```text
+/canon notesafety
+```
+
+Official scripting reference: https://help.aidungeon.com/faq/how-do-i-write-scripts-and-use-scripting
+
+---
+
 ## 📥 Installation — now zero-config
 
 AI Dungeon provides **Library, Input, Context and Output** script tabs. Copy:
@@ -48,12 +82,12 @@ The non-Library files already finish with `modifier(text)`.
 
 ### ✅ You do **not** need to import a Config JSON just to make the script work
 
-CANON WEAVE now contains an embedded first-run installer. If the script code is installed but no `Canon Config` Story Card exists, the first real Adventure hook automatically creates:
+CANON WEAVE contains an embedded first-run installer. If the script code is installed but no `Canon Config` Story Card exists, the first real Adventure hook safely creates working Config cards using only the documented Story Card scripting fields:
 
 - ⚙️ **CANON WEAVE — MASTER CONFIG**
 - 🛠️ **CANON WEAVE — ADVANCED CONFIG**
 
-The engine also works from embedded defaults if Story Card creation is unavailable, so a missing Config card can no longer make CANON WEAVE appear dead.
+The engine also works from embedded defaults if Story Card creation is unavailable, so a missing Config card can no longer make CANON WEAVE appear dead. Runtime creation intentionally does **not** set Notes or Title; use the optional JSON import if you want those editor fields pre-populated.
 
 ### Important AI Dungeon editor limitation
 
