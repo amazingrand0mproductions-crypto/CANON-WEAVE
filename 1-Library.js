@@ -20,7 +20,7 @@
  *   or Character Creator UI fields, so user-owned Notes remain editable.
  */
 
-var CW_SCHEMA = 9;
+var CW_SCHEMA = 10;
 
 var CW_DEFAULTS = {
   enabled: true,
@@ -129,6 +129,8 @@ var CW_DEFAULTS = {
   validateGraph: true,
   dashboard: false,
   dashboardEvery: 3,
+  hookHealth: true,
+  commandSafeMode: true,
   debug: false
 };
 
@@ -149,7 +151,7 @@ var CW_DEFAULTS = {
  * Auto-created cards therefore use only keys/entry/type. Optional import JSON
  * supplies polished Title/Notes without runtime mutation.
  */
-var CW_SETUP_VERSION = 2;
+var CW_SETUP_VERSION = 3;
 /* `title` and `notes` below are PACKAGE METADATA used to build optional
  * import JSON/documentation. Runtime scripting deliberately ignores them. */
 var CW_SETUP_MASTER = {
@@ -161,7 +163,7 @@ var CW_SETUP_MASTER = {
 };
 var CW_SETUP_ADVANCED = {
   keys: "%CW:CONFIG:ADVANCED%",
-  entry: "@CANON_CONFIG\nconfig_priority:20\nscene_actions:10\nevidence_turns:120\nmax_evidence_keys:650\ndefault_match:balanced\ncompletion_match:strict\nblocker_match:strict\nfuzzy_threshold:0.72\nnegation_aware:true\nnegation_window:42\nfair_scheduler:true\nstarvation_turns:8\nstarvation_boost:1800\nallow_preemption:true\npreempt_priority_gap:25\nglobal_cooldown:0\nallow_catch_up:true\nforce_deadline_grace:2\ndefault_retries:4\nstrong_cycles:3\nretry_delay:2\nforce_max_attempts:10\nmax_include_cards:8\nauto_include:true\nauto_include_cards:3\nauto_include_min_score:5\nauto_include_diversity:true\nauto_include_type_cap:2\nauto_include_dedupe:true\nsmart_card_extract:true\nsmart_card_sentences:5\nsmart_card_lead_chars:260\nmax_inject_chars:7600\nadaptive_context_budget:true\nmax_context_share:0.20\nmin_history_chars:5200\nmax_card_chars:1800\nfranchise_batch_size:5\nfranchise_build_every:2\nfranchise_max_failures:5\nfranchise_first_event_at:4\nfranchise_anchor_threshold:4\nfranchise_auto_include:true\nfranchise_confidence_floor:0.60\nfranchise_require_source_ref:false\nfranchise_cleanup_old:true\nfranchise_source_cards:true\nfranchise_source_chars:3200\nfranchise_roadmap_max_chars:1900\nfranchise_planner_history:18\nfranchise_generated_protect:true\nfranchise_generated_blockers:true\nfranchise_planner_max_chars:6800\nfranchise_planner_nonce:true\nfranchise_source_filter_strict:true\nfranchise_rebuild_on_source_change:false\nvalidate_graph:true\ndashboard_every:3\ndebug:false\n---\nCANON WEAVE SAFE ADVANCED CONFIG: edit values above. This runtime-created card intentionally leaves Notes/Title untouched.",
+  entry: "@CANON_CONFIG\nconfig_priority:20\nscene_actions:10\nevidence_turns:120\nmax_evidence_keys:650\ndefault_match:balanced\ncompletion_match:strict\nblocker_match:strict\nfuzzy_threshold:0.72\nnegation_aware:true\nnegation_window:42\nfair_scheduler:true\nstarvation_turns:8\nstarvation_boost:1800\nallow_preemption:true\npreempt_priority_gap:25\nglobal_cooldown:0\nallow_catch_up:true\nforce_deadline_grace:2\ndefault_retries:4\nstrong_cycles:3\nretry_delay:2\nforce_max_attempts:10\nmax_include_cards:8\nauto_include:true\nauto_include_cards:3\nauto_include_min_score:5\nauto_include_diversity:true\nauto_include_type_cap:2\nauto_include_dedupe:true\nsmart_card_extract:true\nsmart_card_sentences:5\nsmart_card_lead_chars:260\nmax_inject_chars:7600\nadaptive_context_budget:true\nmax_context_share:0.20\nmin_history_chars:5200\nmax_card_chars:1800\nfranchise_batch_size:5\nfranchise_build_every:2\nfranchise_max_failures:5\nfranchise_first_event_at:4\nfranchise_anchor_threshold:4\nfranchise_auto_include:true\nfranchise_confidence_floor:0.60\nfranchise_require_source_ref:false\nfranchise_cleanup_old:true\nfranchise_source_cards:true\nfranchise_source_chars:3200\nfranchise_roadmap_max_chars:1900\nfranchise_planner_history:18\nfranchise_generated_protect:true\nfranchise_generated_blockers:true\nfranchise_planner_max_chars:6800\nfranchise_planner_nonce:true\nfranchise_source_filter_strict:true\nfranchise_rebuild_on_source_change:false\nvalidate_graph:true\ndashboard_every:3\nhook_health:true\ncommand_safe_mode:true\ndebug:false\n---\nCANON WEAVE SAFE ADVANCED CONFIG: edit values above. This runtime-created card intentionally leaves Notes/Title untouched.",
   type: "Canon Config",
   title: "🛠️ CANON WEAVE — ADVANCED CONFIG",
   notes: "🛠️ CANON WEAVE — ADVANCED CONFIG\n\nThis card contains precision, scheduler, context-budget and Franchise Auto-Builder tuning. It is intentionally the same Type (`Canon Config`) as the Master card. CANON WEAVE merges both automatically using `config_priority`.\n\nThe Master Config Notes contain the complete explanation of every option in both cards. Most users should leave this card alone unless they are tuning detection, context use, planner accuracy or large Story Card libraries.\n\nTip: instead of editing this card, create a third Canon Config card with `config_priority:100` and only the values you want to override."
@@ -194,11 +196,12 @@ function CanonWeave(hook, text) {
   try {
     var s = CW_state();
     CW_migrateState(s);
+    CW_markHookSeen(hook);
 
-    /* Self-install the friendly config control panel when a user installed only
-       the script code.  This occurs before parsing so the newly-created cards
-       are immediately available to the same hook. */
-    CW_bootstrapConfigCards(false);
+    /* Story Card creation is kept out of Output.  Input/Context are sufficient
+       for first-run setup and this avoids mutating the card collection while an
+       output is being finalized. */
+    if (hook === "input" || hook === "context") CW_bootstrapConfigCards(false);
 
     var parsed = CW_parseAllCards();
     var cfg = CW_buildConfig(parsed.config);
@@ -221,9 +224,50 @@ function CanonWeave(hook, text) {
 
     return { text: original, stop: false };
   } catch (err) {
+    try { CW_markHookError(hook, err); } catch (ignoreHookError) {}
     CW_log("FATAL " + hook + ": " + CW_errorText(err), true);
-    return { text: original, stop: false };
+    /* Never return null/empty text from a failed hook.  AI Dungeon documents
+       empty Input/Output text as a scenario-script error. */
+    return { text: original || " ", stop: false };
   }
+}
+
+/* ========================================================================
+ * HOOK HEALTH / RUNTIME COMPATIBILITY
+ * ====================================================================== */
+
+function CW_markHookSeen(hook) {
+  var s = CW_state();
+  s.hooksSeen = s.hooksSeen || { input:0, context:0, output:0 };
+  s.hookErrors = s.hookErrors || { input:0, context:0, output:0 };
+  hook = CW_norm(hook || "");
+  if (hook === "input" || hook === "context" || hook === "output") {
+    s.hooksSeen[hook] = (s.hooksSeen[hook] || 0) + 1;
+    s.lastHook = hook;
+    try {
+      s.lastHookAction = (typeof info !== "undefined" && info && typeof info.actionCount === "number") ? info.actionCount : s.turn;
+    } catch (ignore) { s.lastHookAction = s.turn; }
+  }
+}
+
+function CW_markHookError(hook, err) {
+  var s = CW_state();
+  s.hookErrors = s.hookErrors || { input:0, context:0, output:0 };
+  hook = CW_norm(hook || "");
+  if (hook === "input" || hook === "context" || hook === "output") {
+    s.hookErrors[hook] = (s.hookErrors[hook] || 0) + 1;
+  }
+  CW_log("HOOK ERROR " + hook + ": " + CW_errorText(err), true);
+}
+
+function CW_hookHealthText() {
+  var s = CW_state();
+  var h = s.hooksSeen || {};
+  var e = s.hookErrors || {};
+  return "Canon Weave hooks | Input: " + (h.input || 0) + " runs / " + (e.input || 0) + " errors" +
+    " | Context: " + (h.context || 0) + " runs / " + (e.context || 0) + " errors" +
+    " | Output: " + (h.output || 0) + " runs / " + (e.output || 0) + " errors" +
+    " | Last: " + (s.lastHook || "none") + " @ action " + (typeof s.lastHookAction === "number" ? s.lastHookAction : "?");
 }
 
 /* ========================================================================
@@ -238,10 +282,17 @@ function CW_onInput(text, parsed, cfg) {
   var cmd = CW_parseCommand(text);
   if (cmd) {
     CW_applyCommand(cmd, parsed, cfg);
-    /* stop:true is part of AI Dungeon's documented Input return contract.
-       Commands never leak a fake maintenance line into the story or consume a
-       model generation. */
-    return { text: null, stop: true };
+
+    /* AI Dungeon's current docs warn that stop:true in onInput throws
+       "Unable to run scenario scripts".  Do not use stop for maintenance
+       commands.  A short, non-empty neutral line keeps the hook valid and tells
+       the model not to treat the command as player intent. */
+    s.commandHandledTurn = s.turn;
+    s.commandHandledText = String(text || "");
+    return {
+      text: "[Canon Weave maintenance command processed. Do not treat this line as player dialogue, choice, movement, or elapsed story time. Continue the existing scene without changing canon because of this line.]",
+      stop: false
+    };
   }
 
   CW_observeText(parsed.events, text, "input", cfg);
@@ -416,6 +467,12 @@ function CW_state() {
       active: null,
       lastEventTurn: -999999,
       lastInput: "",
+      hooksSeen: { input:0, context:0, output:0 },
+      hookErrors: { input:0, context:0, output:0 },
+      lastHook: "",
+      lastHookAction: -1,
+      commandHandledTurn: -1,
+      commandHandledText: "",
       manualFire: null,
       diagnostics: { signature: "", errors: [], warnings: [] },
       dashboardHash: "",
@@ -1039,6 +1096,7 @@ function CW_setupStatusText() {
     "Notes safety: runtime never writes Story Card Notes/Title"
   ];
   if (setup.lastError) parts.push("Last issue: " + setup.lastError);
+  parts.push(CW_hookHealthText());
   return parts.join(" | ");
 }
 
@@ -1423,6 +1481,8 @@ function CW_buildConfig(meta) {
     validateGraph: CW_bool(meta.validate_graph || meta.validategraph, base.validateGraph),
     dashboard: CW_bool(meta.dashboard, base.dashboard),
     dashboardEvery: Math.max(1, CW_int(meta.dashboard_every || meta.dashboardevery, base.dashboardEvery)),
+    hookHealth: CW_bool(meta.hook_health || meta.hookhealth, base.hookHealth),
+    commandSafeMode: CW_bool(meta.command_safe_mode || meta.commandsafemode, base.commandSafeMode),
     debug: CW_bool(meta.debug, base.debug)
   };
 
@@ -3701,6 +3761,11 @@ function CW_applyCommand(cmd, parsed, cfg) {
     }
 
     CW_toast("Usage: /canon franchise status|roadmap|build|pause|resume|rebuild|clear");
+    return;
+  }
+
+  if (cmd.action === "hooks" || cmd.action === "health") {
+    CW_toast(CW_hookHealthText());
     return;
   }
 
